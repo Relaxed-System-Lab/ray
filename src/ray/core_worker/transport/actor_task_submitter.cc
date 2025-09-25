@@ -200,6 +200,8 @@ Status ActorTaskSubmitter::SubmitTask(TaskSpecification task_spec) {
         [task_spec, send_pos, this]() mutable {
           // We must release the lock before resolving the task dependencies since
           // the callback may get called in the same call stack.
+          RAY_LOG(DEBUG).WithField(task_spec.TaskId())
+              << "execute on io_service_thread to resolve dependencies";
           auto actor_id = task_spec.ActorId();
           auto task_id = task_spec.TaskId();
           resolver_.ResolveDependencies(

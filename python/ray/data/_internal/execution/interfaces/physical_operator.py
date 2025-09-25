@@ -117,6 +117,9 @@ class DataOpTask(OpTask):
                     # And it's not stopped yet.
                     break
             except StopIteration:
+                logger.debug("Final Task completed: Object Ref Generator: "
+                             f"{self._streaming_gen._generator_ref.hex()}, "
+                             f"task_id={self._streaming_gen._generator_ref.task_id()}")
                 self._task_done_callback(None)
                 break
 

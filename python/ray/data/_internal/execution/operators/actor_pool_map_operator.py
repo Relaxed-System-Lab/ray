@@ -235,6 +235,7 @@ class ActorPoolMapOperator(MapOperator):
                 *input_blocks,
                 **self.get_map_task_kwargs(),
             )
+            logger.debug(f"{self._name}: submit task {gen._generator_ref.task_id()}")
 
             def _task_done_callback(actor_to_return):
                 # Return the actor that was running the task to the pool.

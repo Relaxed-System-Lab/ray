@@ -112,8 +112,11 @@ void ActorSchedulingQueue::Add(
         task_spec,
         rpc::TaskStatus::PENDING_ACTOR_TASK_ARGS_FETCH,
         /* include_task_info */ false));
+    RAY_LOG(DEBUG) << "Waiting for dependencies for seqno " << seq_no << ", task_id "
+                   << task_spec.TaskId();
     waiter_.Wait(dependencies, [seq_no, this]() {
       RAY_CHECK(std::this_thread::get_id() == main_thread_id_);
+      RAY_LOG(DEBUG) << "Dependency satisfied for " << seq_no;
       auto it = pending_actor_tasks_.find(seq_no);
       if (it != pending_actor_tasks_.end()) {
         const TaskSpecification &task_spec = it->second.TaskSpec();
@@ -125,6 +128,7 @@ void ActorSchedulingQueue::Add(
             rpc::TaskStatus::PENDING_ACTOR_TASK_ORDERING_OR_CONCURRENCY,
             /* include_task_info */ false));
         it->second.MarkDependenciesSatisfied();
+        RAY_LOG(DEBUG) << "Marked dependencies satisfied for " << seq_no << " task_id " << it->second.TaskID();
         ScheduleRequests();
       }
     });
@@ -176,6 +180,9 @@ void ActorSchedulingQueue::ScheduleRequests() {
     auto head = pending_actor_tasks_.begin();
     auto request = head->second;
     auto task_id = head->second.TaskID();
+
+    RAY_LOG(DEBUG) << "Scheduling actor task " << task_id
+                   << " with seqno: " << head->first;
 
     if (is_asyncio_) {
       // Process async actor task.

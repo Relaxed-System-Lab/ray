@@ -3314,7 +3314,9 @@ Status CoreWorker::ExecuteTask(
   // execution and unpinned once the task completes. We will notify the caller
   // about any IDs that we are still borrowing by the time the task completes.
   std::vector<ObjectID> borrowed_ids;
+  RAY_LOG(DEBUG).WithField(task_spec.TaskId()) << "Start getting and pinning args for executor";
   RAY_CHECK_OK(GetAndPinArgsForExecutor(task_spec, &args, &arg_refs, &borrowed_ids));
+  RAY_LOG(DEBUG).WithField(task_spec.TaskId()) << "Finished getting and pinning args";
 
   for (size_t i = 0; i < task_spec.NumReturns(); i++) {
     return_objects->emplace_back(task_spec.ReturnId(i), nullptr);
@@ -3370,6 +3372,7 @@ Status CoreWorker::ExecuteTask(
   } else if (task_spec.IsActorTask()) {
     name_of_concurrency_group_to_execute = task_spec.ConcurrencyGroupName();
   }
+  RAY_LOG(DEBUG) << "Actually start executing task " << task_spec.TaskId();
   status = options_.task_execution_callback(
       task_spec.CallerAddress(),
       task_type,
@@ -3393,6 +3396,8 @@ Status CoreWorker::ExecuteTask(
       /*retry_exception=*/task_spec.ShouldRetryExceptions(),
       /*generator_backpressure_num_objects=*/
       task_spec.GeneratorBackpressureNumObjects());
+  RAY_LOG(DEBUG) << "Finished executing task " << task_spec.TaskId()
+                 << ", status = " << status;
 
   // Get the reference counts for any IDs that we borrowed during this task,
   // remove the local reference for these IDs, and return the ref count info to
@@ -3877,6 +3882,8 @@ void CoreWorker::HandlePushTask(rpc::PushTaskRequest request,
          func_name]() mutable {
           // We have posted an exit task onto the main event loop,
           // so shouldn't bother executing any further work.
+          RAY_LOG(DEBUG).WithField(TaskID::FromBinary(request.task_spec().task_id()))
+              << "Handle Push Task execute on task_execution_service_";
           if (IsExiting()) {
             RAY_LOG(INFO) << "Queued task " << func_name
                           << " won't be executed because the worker already exited.";

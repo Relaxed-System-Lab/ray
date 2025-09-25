@@ -123,6 +123,8 @@ void CoreWorkerClient::SendRequests() {
           callback(status, std::move(reply));
         };
 
+    RAY_LOG(DEBUG) << "Sending task " << TaskID::FromBinary(request->task_spec().task_id()) << " to "
+                  << addr_.ip_address() << ":" << addr_.port();
     RAY_UNUSED(INVOKE_RPC_CALL(CoreWorkerService,
                                PushTask,
                                *request,

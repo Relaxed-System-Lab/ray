@@ -212,6 +212,9 @@ Status RayletClient::WaitForDirectActorCallArgs(
   auto message = protocol::CreateWaitForDirectActorCallArgsRequest(
       fbb, to_flatbuf(fbb, object_ids), AddressesToFlatbuffer(fbb, owner_addresses), tag);
   fbb.Finish(message);
+  RAY_LOG(DEBUG) << "WaitForDirectActorCallArgsRequest, object_ids.size()="
+                << object_ids.size() << ", owner_addresses.size()=" << owner_addresses.size()
+                << ", tag=" << tag;
   return conn_->WriteMessage(MessageType::WaitForDirectActorCallArgsRequest, &fbb);
 }
 

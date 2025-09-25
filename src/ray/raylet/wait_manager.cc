@@ -91,6 +91,8 @@ void WaitManager::WaitComplete(uint64_t wait_id) {
       remaining.push_back(object_id);
     }
   }
+  RAY_LOG(DEBUG) << "Wait request " << wait_id
+                 << " is completed, and callback will be invoked.";
   wait_request.callback(ready, remaining);
   wait_requests_.erase(wait_id);
   RAY_LOG(DEBUG) << "Wait request " << wait_id << " finished: ready " << ready.size()

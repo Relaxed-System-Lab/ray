@@ -72,6 +72,8 @@ void LocalDependencyResolver::CancelDependencyResolution(const TaskID &task_id) 
 
 void LocalDependencyResolver::ResolveDependencies(
     TaskSpecification &task, std::function<void(Status)> on_dependencies_resolved) {
+  RAY_LOG(DEBUG).WithField(task.TaskId())
+      << "resolve dependencies for task, num args = " << task.NumArgs();
   absl::flat_hash_set<ObjectID> local_dependency_ids;
   absl::flat_hash_set<ActorID> actor_dependency_ids;
   for (size_t i = 0; i < task.NumArgs(); i++) {
@@ -89,6 +91,8 @@ void LocalDependencyResolver::ResolveDependencies(
     }
   }
   if (local_dependency_ids.empty() && actor_dependency_ids.empty()) {
+    RAY_LOG(DEBUG).WithField(task.TaskId())
+        << "no dependencies to resolve, invoking callback directly";
     on_dependencies_resolved(Status::OK());
     return;
   }
@@ -111,6 +115,8 @@ void LocalDependencyResolver::ResolveDependencies(
         obj_id, [this, task_id, obj_id](std::shared_ptr<RayObject> obj) {
           RAY_CHECK(obj != nullptr);
 
+          RAY_LOG(DEBUG).WithField(task_id)
+              << "resolved dependency " << obj_id << " for task";
           std::unique_ptr<TaskState> resolved_task_state = nullptr;
           std::vector<ObjectID> inlined_dependency_ids;
           std::vector<ObjectID> contained_ids;
@@ -125,11 +131,15 @@ void LocalDependencyResolver::ResolveDependencies(
             auto &state = it->second;
             state->local_dependencies[obj_id] = std::move(obj);
             if (--state->obj_dependencies_remaining == 0) {
+              RAY_LOG(DEBUG).WithField(task_id)
+                  << "all object dependencies resolved for task";
               InlineDependencies(state->local_dependencies,
                                  state->task,
                                  &inlined_dependency_ids,
                                  &contained_ids);
               if (state->actor_dependencies_remaining == 0) {
+                RAY_LOG(DEBUG).WithField(task_id)
+                    << "all dependencies resolved for task";
                 resolved_task_state = std::move(state);
                 pending_tasks_.erase(it);
               }

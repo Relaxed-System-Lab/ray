@@ -1879,6 +1879,8 @@ void NodeManager::ProcessWaitForDirectActorCallArgsRequestMessage(
       flatbuffers::GetRoot<protocol::WaitForDirectActorCallArgsRequest>(message_data);
   std::vector<ObjectID> object_ids = from_flatbuf<ObjectID>(*message->object_ids());
   int64_t tag = message->tag();
+  RAY_LOG(DEBUG) << "Processing wait for direct actor call args request for tag "
+                 << tag << " with " << object_ids.size() << " object IDs.";
   // Resolve any missing objects. This will pull the objects from remote node
   // managers or store an error if the objects have failed.
   const auto refs =

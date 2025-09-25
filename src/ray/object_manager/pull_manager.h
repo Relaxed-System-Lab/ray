@@ -285,6 +285,9 @@ class PullManager {
     void AddBundlePullRequest(uint64_t request_id, BundlePullRequest request) {
       requests.emplace(request_id, request);
       if (request.IsPullable()) {
+        RAY_LOG(DEBUG) << "Adding inactive pull request " << request_id
+                       << " for bundle with " << request.objects.size()
+                       << " objects.";
         inactive_requests.emplace(request_id);
         inactive_by_name.Increment(request.task_key);
         RAY_CHECK_EQ(inactive_requests.size(), inactive_by_name.Total());
@@ -310,6 +313,7 @@ class PullManager {
     void MarkBundleAsPullable(uint64_t request_id) {
       RAY_CHECK(map_find_or_die(requests, request_id).IsPullable());
       RAY_CHECK_EQ(active_requests.count(request_id), 0u);
+      RAY_LOG(DEBUG) << "Marking pull request " << request_id << " as pullable.";
       inactive_requests.emplace(request_id);
       auto task_key = map_find_or_die(requests, request_id).task_key;
       inactive_by_name.Increment(task_key);

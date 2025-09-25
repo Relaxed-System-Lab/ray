@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import ray
+from ray._raylet import ObjectRef
 from ray.data._internal.execution.backpressure_policy import BackpressurePolicy
 from ray.data._internal.execution.bundle_queue import create_bundle_queue
 from ray.data._internal.execution.interfaces import (
@@ -446,6 +447,10 @@ def process_completed_tasks(
         # yield resources, instead of having all tasks output blocks together.
         ready_tasks_by_op = defaultdict(list)
         for ref in ready:
+            if isinstance(ref, ObjectRef):
+                logger.debug(f"Task completed: Object Ref: {ref.hex()}, task_id={ref.task_id()}")
+            else:
+                logger.debug(f"Task completed: Object Ref Generator: {ref._generator_ref.hex()}, task_id={ref._generator_ref.task_id()} ")
             state, task = active_tasks[ref]
             ready_tasks_by_op[state].append(task)
 

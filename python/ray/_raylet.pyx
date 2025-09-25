@@ -557,6 +557,9 @@ class ObjectRefGenerator:
             "You cannot return or pass a generator to other task. "
             "Serializing a ObjectRefGenerator is not allowed.")
 
+    def __str__(self):
+        return f"ObjectRefGenerator({self._generator_ref.task_id()})"
+
 
 # For backward compatibility.
 StreamingObjectRefGenerator = ObjectRefGenerator
