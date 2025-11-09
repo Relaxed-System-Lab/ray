@@ -243,6 +243,14 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         metrics_group=MetricsGroup.INPUTS,
         map_only=True,
     )
+    rows_task_inputs_processed: int = metric_field(
+        default=0,
+        description=(
+            "Number of input rows that operator's tasks have finished processing."
+        ),
+        metrics_group=MetricsGroup.INPUTS,
+        map_only=True,
+    )
     bytes_task_inputs_processed: int = metric_field(
         default=0,
         description=(
@@ -754,6 +762,7 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         self.task_completion_time = task_time_delta
         inputs = self._running_tasks[task_index].inputs
         self.num_task_inputs_processed += len(inputs)
+        self.rows_task_inputs_processed += inputs.num_rows() or 0
         total_input_size = inputs.size_bytes()
         self.bytes_task_inputs_processed += total_input_size
         input_size = inputs.size_bytes()
