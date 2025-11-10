@@ -5,7 +5,7 @@ import uuid
 import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import ray
 from ray.actor import ActorHandle
@@ -584,7 +584,8 @@ class _ActorTaskSelectorImpl(_ActorTaskSelector):
 
         while input_queue:
             # Filter out actors that are invalid, i.e. actors with number of tasks in
-            # flight >= _max_tasks_in_flight or actor_state is not ALIVE.
+            # flight >= _max_tasks_in_flight or actor_state is not ALIVE,
+            # or actors that are marked for removal.
             bundle = input_queue.peek()
             valid_actors = [
                 actor
@@ -592,6 +593,7 @@ class _ActorTaskSelectorImpl(_ActorTaskSelector):
                 if self._actor_pool.running_actors()[actor].num_tasks_in_flight
                 < self._actor_pool.max_tasks_in_flight_per_actor()
                 and not self._actor_pool.running_actors()[actor].is_restarting
+                and not self._actor_pool.is_actor_marked_for_removal(actor)
             ]
 
             if not valid_actors:
@@ -739,6 +741,8 @@ class _ActorPool(AutoscalingActorPool):
         self._num_restarting_actors: int = 0
         self._num_active_actors: int = 0
         self._total_num_tasks_in_flight: int = 0
+        # Actors marked for removal (will be killed when they complete current tasks)
+        self._actors_marked_for_removal: Set[ray.actor.ActorHandle] = set()
 
     # === Overriding methods of AutoscalingActorPool ===
 
@@ -851,6 +855,80 @@ class _ActorPool(AutoscalingActorPool):
 
         return None
 
+    def my_scale_down(self, target_num_actors: int, forced: bool = False) -> Tuple[int, int]:
+        """Scale down the actor pool by the target number of actors.
+
+        This method ensures that the target number of actors will be killed,
+        even if they are currently executing tasks. Inactive actors (pending
+        or idle) are killed immediately, while active actors are either marked
+        for removal (if forced=False) or killed immediately (if forced=True).
+
+        Args:
+            target_num_actors: The number of actors to scale down.
+            forced: If True, active actors will be killed immediately even if they
+                have tasks in flight. If False (default), active actors will be marked
+                for removal and killed when they complete their current tasks.
+
+        Returns:
+            A tuple of (num_removed, num_marked) where:
+            - num_removed: The number of actors that were killed immediately.
+            - num_marked: The number of actors that were marked for removal
+                (only applicable when forced=False).
+        """
+        num_removed = 0
+
+        # Phase 1: Kill inactive actors immediately
+        for _ in range(target_num_actors):
+            if self._remove_inactive_actor():
+                num_removed += 1
+            else:
+                # No more inactive actors available
+                break
+
+        # Phase 2: Handle active actors
+        num_marked = 0
+        remaining = target_num_actors - num_removed
+        if remaining > 0:
+            # Get active actors (actors with tasks in flight) that are not already marked
+            active_actors = [
+                (actor, state)
+                for actor, state in self._running_actors.items()
+                if state.num_tasks_in_flight > 0
+                and actor not in self._actors_marked_for_removal
+            ]
+
+            # Sort by num_tasks_in_flight (ascending) to prioritize actors with fewer tasks
+            active_actors.sort(key=lambda x: x[1].num_tasks_in_flight)
+
+            if forced:
+                # Forced mode: Kill active actors immediately
+                for actor, state in active_actors[:remaining]:
+                    logger.debug(
+                        f"Force killing actor {self._actor_to_logical_id.get(actor, 'unknown')} "
+                        f"with {state.num_tasks_in_flight} tasks in flight"
+                    )
+                    self._release_running_actor(actor)
+                    num_removed += 1
+            else:
+                # Normal mode: Mark active actors for removal
+                for actor, state in active_actors[:remaining]:
+                    self._actors_marked_for_removal.add(actor)
+                    num_marked += 1
+                    logger.debug(
+                        f"Marked actor {self._actor_to_logical_id.get(actor, 'unknown')} "
+                        f"for removal (num_tasks_in_flight={state.num_tasks_in_flight}, "
+                        f"will be killed after completing current tasks)"
+                    )
+
+        if num_removed > 0 or num_marked > 0:
+            logger.debug(
+                f"my_scale_down: removed {num_removed} actors immediately, "
+                f"marked {num_marked} actors for removal "
+                f"(target={target_num_actors}, forced={forced}, {self.get_actor_info()})"
+            )
+
+        return num_removed, num_marked
+
     def _create_actor(self) -> Tuple[ray.actor.ActorHandle, ObjectRef]:
         logical_actor_id = str(uuid.uuid4())
         labels = {self.get_logical_id_label_key(): logical_actor_id}
@@ -932,6 +1010,15 @@ class _ActorPool(AutoscalingActorPool):
         if not self._running_actors[actor].num_tasks_in_flight:
             self._num_active_actors -= 1
 
+            # Check if this actor was marked for removal
+            if actor in self._actors_marked_for_removal:
+                self._actors_marked_for_removal.remove(actor)
+                logger.debug(
+                    f"Killing actor {self._actor_to_logical_id.get(actor, 'unknown')} "
+                    f"that was marked for removal"
+                )
+                self._release_running_actor(actor)
+
     def get_pending_actor_refs(self) -> List[ray.ObjectRef]:
         return list(self._pending_actors.keys())
 
@@ -957,6 +1044,17 @@ class _ActorPool(AutoscalingActorPool):
     def num_idle_actors(self) -> int:
         """Return the number of idle actors in the pool."""
         return len(self._running_actors) - self._num_active_actors
+
+    def is_actor_marked_for_removal(self, actor: ray.actor.ActorHandle) -> bool:
+        """Check if an actor is marked for removal.
+
+        Args:
+            actor: The actor to check.
+
+        Returns:
+            True if the actor is marked for removal, False otherwise.
+        """
+        return actor in self._actors_marked_for_removal
 
     def _remove_inactive_actor(self) -> bool:
         """Kills a single pending or idle actor, if any actors are pending/idle.

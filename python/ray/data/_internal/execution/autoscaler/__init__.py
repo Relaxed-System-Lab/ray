@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 from .autoscaler import Autoscaler
 from .autoscaling_actor_pool import AutoscalingActorPool
 from .default_autoscaler import DefaultAutoscaler
+from .ds2_autoscaler import DS2Autoscaler
 
 if TYPE_CHECKING:
     from ..resource_manager import ResourceManager
@@ -17,10 +18,10 @@ def create_autoscaler(
     *,
     execution_id: str
 ) -> Autoscaler:
-    return DefaultAutoscaler(
+    # Use DS2Autoscaler instead of DefaultAutoscaler
+    return DS2Autoscaler(
         topology,
         resource_manager,
-        config=config,
         execution_id=execution_id,
     )
 
@@ -28,6 +29,7 @@ def create_autoscaler(
 __all__ = [
     "Autoscaler",
     "DefaultAutoscaler",
+    "DS2Autoscaler",
     "create_autoscaler",
     "AutoscalingActorPool",
 ]
