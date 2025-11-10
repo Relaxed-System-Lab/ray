@@ -751,6 +751,256 @@ def test_actor_pool_fault_tolerance_e2e(ray_start_cluster, restore_data_context)
     assert sorted(res, key=lambda x: x["id"]) == [{"id": i} for i in range(num_items)]
 
 
+class TestMyScaleDown(unittest.TestCase):
+    """Test the my_scale_down method that ensures actors are killed."""
+
+    def setup_class(self):
+        self._last_created_actor_and_ready_ref: Optional[
+            Tuple[ActorHandle, ObjectRef[Any]]
+        ] = None
+        self._actor_node_id = "node1"
+        ray.init(num_cpus=4)
+
+    def teardown_class(self):
+        ray.shutdown()
+
+    def _create_actor_fn(self, labels: Dict[str, str]) -> Tuple[ActorHandle, ObjectRef]:
+        actor = PoolWorker.remote(node_id=self._actor_node_id)
+        ready_ref = actor.get_location.remote()
+        self._last_created_actor_and_ready_ref = (actor, ready_ref)
+        return actor, ready_ref
+
+    def _create_pool(
+        self,
+        min_size=1,
+        max_size=4,
+        max_tasks_in_flight=4,
+    ):
+        pool = _ActorPool(
+            min_size=min_size,
+            max_size=max_size,
+            max_actor_concurrency=1,
+            max_tasks_in_flight_per_actor=max_tasks_in_flight,
+            create_actor_fn=self._create_actor_fn,
+            per_actor_resource_usage=ExecutionResources(cpu=1),
+        )
+        return pool
+
+    def _add_pending_actor(
+        self, pool: _ActorPool, node_id="node1"
+    ) -> Tuple[ActorHandle, ObjectRef[Any]]:
+        self._actor_node_id = node_id
+        num_actors = pool.scale(
+            ActorPoolScalingRequest(delta=1, reason="adding pending actor")
+        )
+        assert num_actors == 1
+
+        actor, ready_ref = self._last_created_actor_and_ready_ref
+        self._last_created_actor_and_ready_ref = None
+
+        return actor, ready_ref
+
+    def _wait_for_actor_ready(self, pool: _ActorPool, ready_ref):
+        ray.get(ready_ref)
+        pool.pending_to_running(ready_ref)
+
+    def _add_ready_actor(self, pool: _ActorPool, node_id="node1") -> ActorHandle:
+        actor, ready_ref = self._add_pending_actor(pool, node_id)
+        self._wait_for_actor_ready(pool, ready_ref)
+        return actor
+
+    def test_my_scale_down_with_inactive_actors(self):
+        """Test my_scale_down kills inactive actors immediately."""
+        pool = self._create_pool(min_size=1, max_size=4)
+
+        # Add 3 ready actors
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        actor3 = self._add_ready_actor(pool)
+
+        assert pool.num_running_actors() == 3
+        assert pool.num_idle_actors() == 3
+
+        # Scale down by 2 actors
+        num_removed, num_marked = pool.my_scale_down(2)
+
+        # Should have removed 2 actors immediately
+        assert num_removed == 2
+        assert num_marked == 0
+        assert pool.num_running_actors() == 1
+
+    def test_my_scale_down_with_active_actors(self):
+        """Test my_scale_down marks active actors for removal."""
+        pool = self._create_pool(min_size=1, max_size=4)
+
+        # Add 3 ready actors
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        actor3 = self._add_ready_actor(pool)
+
+        # Submit tasks to all actors to make them active
+        pool.on_task_submitted(actor1)
+        pool.on_task_submitted(actor2)
+        pool.on_task_submitted(actor3)
+
+        assert pool.num_running_actors() == 3
+        assert pool.num_active_actors() == 3
+        assert pool.num_idle_actors() == 0
+
+        # Scale down by 2 actors
+        num_removed, num_marked = pool.my_scale_down(2)
+
+        # Should have marked 2 actors for removal
+        assert num_removed == 0
+        assert num_marked == 2
+        # All actors should still be running
+        assert pool.num_running_actors() == 3
+
+        # Check that 2 actors are marked for removal
+        assert pool.is_actor_marked_for_removal(actor1)
+        assert pool.is_actor_marked_for_removal(actor2)
+        assert not pool.is_actor_marked_for_removal(actor3)
+
+        # Complete task on actor1
+        pool.on_task_completed(actor1)
+
+        # Actor1 should be killed now
+        assert pool.num_running_actors() == 2
+        assert not pool.is_actor_marked_for_removal(actor1)
+
+        # Complete task on actor2
+        pool.on_task_completed(actor2)
+
+        # Actor2 should be killed now
+        assert pool.num_running_actors() == 1
+
+    def test_my_scale_down_mixed_actors(self):
+        """Test my_scale_down with both active and inactive actors."""
+        pool = self._create_pool(min_size=1, max_size=4)
+
+        # Add 4 ready actors
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        actor3 = self._add_ready_actor(pool)
+        actor4 = self._add_ready_actor(pool)
+
+        # Submit tasks to 2 actors to make them active
+        pool.on_task_submitted(actor1)
+        pool.on_task_submitted(actor2)
+
+        assert pool.num_running_actors() == 4
+        assert pool.num_active_actors() == 2
+        assert pool.num_idle_actors() == 2
+
+        # Scale down by 3 actors
+        num_removed, num_marked = pool.my_scale_down(3)
+
+        # Should have removed 2 idle actors immediately and marked 1 active actor
+        assert num_removed == 2
+        assert num_marked == 1
+        # 2 actors should be killed immediately (idle ones)
+        assert pool.num_running_actors() == 2
+
+        # One of the active actors should be marked for removal
+        marked_count = sum(
+            1
+            for actor in [actor1, actor2]
+            if pool.is_actor_marked_for_removal(actor)
+        )
+        assert marked_count == 1
+
+    def test_my_scale_down_prioritizes_fewer_tasks(self):
+        """Test my_scale_down prioritizes actors with fewer in-flight tasks."""
+        pool = self._create_pool(min_size=1, max_size=4, max_tasks_in_flight=4)
+
+        # Add 3 ready actors
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        actor3 = self._add_ready_actor(pool)
+
+        # Submit different numbers of tasks to each actor
+        # actor1: 3 tasks
+        pool.on_task_submitted(actor1)
+        pool.on_task_submitted(actor1)
+        pool.on_task_submitted(actor1)
+
+        # actor2: 1 task
+        pool.on_task_submitted(actor2)
+
+        # actor3: 2 tasks
+        pool.on_task_submitted(actor3)
+        pool.on_task_submitted(actor3)
+
+        assert pool.num_running_actors() == 3
+        assert pool.num_active_actors() == 3
+
+        # Scale down by 2 actors
+        num_removed, num_marked = pool.my_scale_down(2)
+
+        # Should have marked 2 actors for removal
+        assert num_removed == 0
+        assert num_marked == 2
+
+        # actor2 (1 task) and actor3 (2 tasks) should be marked, not actor1 (3 tasks)
+        assert pool.is_actor_marked_for_removal(actor2)
+        assert pool.is_actor_marked_for_removal(actor3)
+        assert not pool.is_actor_marked_for_removal(actor1)
+
+    def test_my_scale_down_forced_mode(self):
+        """Test my_scale_down with forced=True kills active actors immediately."""
+        pool = self._create_pool(min_size=1, max_size=4)
+
+        # Add 3 ready actors
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        actor3 = self._add_ready_actor(pool)
+
+        # Submit tasks to all actors to make them active
+        pool.on_task_submitted(actor1)
+        pool.on_task_submitted(actor2)
+        pool.on_task_submitted(actor3)
+
+        assert pool.num_running_actors() == 3
+        assert pool.num_active_actors() == 3
+        assert pool.num_idle_actors() == 0
+
+        # Scale down by 2 actors with forced=True
+        num_removed, num_marked = pool.my_scale_down(2, forced=True)
+
+        # Should have killed 2 actors immediately
+        assert num_removed == 2
+        assert num_marked == 0
+        # Only 1 actor should remain
+        assert pool.num_running_actors() == 1
+
+    def test_my_scale_down_forced_mixed_actors(self):
+        """Test my_scale_down with forced=True on mixed active/inactive actors."""
+        pool = self._create_pool(min_size=1, max_size=4)
+
+        # Add 4 ready actors
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        actor3 = self._add_ready_actor(pool)
+        actor4 = self._add_ready_actor(pool)
+
+        # Submit tasks to 2 actors to make them active
+        pool.on_task_submitted(actor1)
+        pool.on_task_submitted(actor2)
+
+        assert pool.num_running_actors() == 4
+        assert pool.num_active_actors() == 2
+        assert pool.num_idle_actors() == 2
+
+        # Scale down by 3 actors with forced=True
+        num_removed, num_marked = pool.my_scale_down(3, forced=True)
+
+        # Should have killed 2 idle actors + 1 active actor immediately
+        assert num_removed == 3
+        assert num_marked == 0
+        # Only 1 actor should remain
+        assert pool.num_running_actors() == 1
+
+
 if __name__ == "__main__":
     import sys
 
