@@ -477,6 +477,9 @@ class ActorPoolMapOperator(MapOperator):
         """Returns Actor counts for Alive, Restarting and Pending Actors."""
         return self._actor_pool.get_actor_info()
 
+    def get_per_actor_resource_usage(self) -> ExecutionResources:
+        return self._actor_pool._per_actor_resource_usage
+
 
 class _MapWorker:
     """An actor worker for MapOperator."""
