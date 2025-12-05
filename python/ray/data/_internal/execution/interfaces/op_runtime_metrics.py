@@ -251,6 +251,24 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         metrics_group=MetricsGroup.INPUTS,
         map_only=True,
     )
+    last_rows_task_inputs_processed: int = metric_field(
+        default=0,
+        description=(
+            "Snapshot of rows_task_inputs_processed from last autoscaling call."
+        ),
+        metrics_group=MetricsGroup.INPUTS,
+        map_only=True,
+        internal_only=True,
+    )
+    ema_processed_rows: float = metric_field(
+        default=0.0,
+        description=(
+            "Exponential moving average of processed rows per autoscaling window."
+        ),
+        metrics_group=MetricsGroup.INPUTS,
+        map_only=True,
+        internal_only=True,
+    )
     bytes_task_inputs_processed: int = metric_field(
         default=0,
         description=(
@@ -360,6 +378,22 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         description="Time spent generating blocks in tasks.",
         metrics_group=MetricsGroup.TASKS,
         map_only=True,
+    )
+    last_block_generation_time: float = metric_field(
+        default=0,
+        description="Snapshot of block_generation_time from last autoscaling call.",
+        metrics_group=MetricsGroup.TASKS,
+        map_only=True,
+        internal_only=True,
+    )
+    ema_wall_time: float = metric_field(
+        default=0.0,
+        description=(
+            "Exponential moving average of wall time per autoscaling window."
+        ),
+        metrics_group=MetricsGroup.TASKS,
+        map_only=True,
+        internal_only=True,
     )
     task_submission_backpressure_time: float = metric_field(
         default=0,
