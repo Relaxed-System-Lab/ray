@@ -21,6 +21,11 @@ class DS2Autoscaler(Autoscaler):
     # Min number of seconds between two autoscaling requests.
     MIN_GAP_BETWEEN_AUTOSCALING_REQUESTS = 60
 
+    # EMA smoothing factor (alpha) for throughput calculation.
+    # Higher values (closer to 1.0) give more weight to recent observations.
+    # Lower values (closer to 0.0) give more weight to historical data.
+    EMA_ALPHA = 0.5
+
     def __init__(
         self,
         topology: "Topology",
@@ -68,9 +73,13 @@ class DS2Autoscaler(Autoscaler):
 
         # Collect metrics from all ActorPoolMapOperators
         wall_time_list = self.get_wall_time()
+        logger.debug(f"Wall time list: {wall_time_list}")
         num_processed_rows_list = self.get_num_processed_rows()
+        logger.debug(f"Num processed rows list: {num_processed_rows_list}")
         per_actor_resource_usage_list = self.get_per_actor_resource_usage()
+        logger.debug(f"Per actor resource usage list: {per_actor_resource_usage_list}")
         total_resources = self.get_total_resources()
+        logger.debug(f"Total resources: {total_resources}")
         n = len(wall_time_list)
 
         if n == 0:
@@ -224,17 +233,80 @@ class DS2Autoscaler(Autoscaler):
                 # )
 
     def get_wall_time(self) -> List[float]:
+        """Get smoothed wall time for each operator using EMA.
+
+        Computes the exponential moving average (EMA) of wall time deltas
+        to smooth out short-term fluctuations and provide a more stable
+        estimate of operator throughput.
+
+        Returns:
+            List of EMA-smoothed wall time values for each ActorPoolMapOperator.
+        """
         wall_time_list = []
         for op in self._topology:
             if isinstance(op, ActorPoolMapOperator):
-                wall_time_list.append(op._metrics.block_generation_time)
+                current_time = op._metrics.block_generation_time
+                last_time = op._metrics.last_block_generation_time
+
+                # Calculate the time delta since last call
+                time_delta = current_time - last_time
+
+                # Apply EMA smoothing
+                if op._metrics.ema_wall_time == 0.0:
+                    # First time: initialize EMA with current delta
+                    ema_time = time_delta
+                else:
+                    # EMA formula: EMA_new = α * current + (1 - α) * EMA_old
+                    ema_time = (
+                        self.EMA_ALPHA * time_delta +
+                        (1 - self.EMA_ALPHA) * op._metrics.ema_wall_time
+                    )
+
+                # Update metrics
+                op._metrics.ema_wall_time = ema_time
+                op._metrics.last_block_generation_time = current_time
+
+                wall_time_list.append(ema_time)
+
         return wall_time_list
 
     def get_num_processed_rows(self) -> List[int]:
+        """Get smoothed number of processed rows for each operator using EMA.
+
+        Computes the exponential moving average (EMA) of processed rows deltas
+        to smooth out short-term fluctuations and provide a more stable
+        estimate of operator throughput.
+
+        Returns:
+            List of EMA-smoothed processed row counts for each ActorPoolMapOperator.
+        """
         num_processed_rows_list = []
         for op in self._topology:
             if isinstance(op, ActorPoolMapOperator):
-                num_processed_rows_list.append(op._metrics.rows_task_inputs_processed)
+                current_rows = op._metrics.rows_task_inputs_processed
+                last_rows = op._metrics.last_rows_task_inputs_processed
+
+                # Calculate the rows delta since last call
+                rows_delta = current_rows - last_rows
+
+                # Apply EMA smoothing
+                if op._metrics.ema_processed_rows == 0.0:
+                    # First time: initialize EMA with current delta
+                    ema_rows = float(rows_delta)
+                else:
+                    # EMA formula: EMA_new = α * current + (1 - α) * EMA_old
+                    ema_rows = (
+                        self.EMA_ALPHA * rows_delta +
+                        (1 - self.EMA_ALPHA) * op._metrics.ema_processed_rows
+                    )
+
+                # Update metrics
+                op._metrics.ema_processed_rows = ema_rows
+                op._metrics.last_rows_task_inputs_processed = current_rows
+
+                # Return as integer (rounded)
+                num_processed_rows_list.append(int(round(ema_rows)))
+
         return num_processed_rows_list
     
     def get_per_actor_resource_usage(self) -> List[ExecutionResources]:
