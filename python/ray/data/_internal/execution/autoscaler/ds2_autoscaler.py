@@ -87,16 +87,21 @@ class DS2Autoscaler(Autoscaler):
                 all_work = False
 
         if not all_work:
-            logger.info(
+            logger.debug(
                 "Not all operators have processed data yet. Skipping DS2 autoscaling."
             )
             return
+        logger.info(
+            f"DS2 autoscaling: unit throughput = {unit_throughput_list}, "
+            f"num processed rows = {num_processed_rows_list}"
+            f"wall times = {wall_time_list}"
+        )
 
         # Extract CPU and GPU usage
         cpu_usage_list = []
         for per_actor_resource_usage in per_actor_resource_usage_list:
             if per_actor_resource_usage._cpu is None:
-                raise ValueError("CPU usage cannot be None")
+                cpu_usage_list.append(0)
             else:
                 cpu_usage_list.append(per_actor_resource_usage._cpu)
 
@@ -144,6 +149,7 @@ class DS2Autoscaler(Autoscaler):
 
                 target_concurrency = concurrency_list[op_index]
                 self._scale_operator(op, target_concurrency)
+
                 op_index += 1
 
         # Update last scaling time
@@ -166,6 +172,10 @@ class DS2Autoscaler(Autoscaler):
         current_size = actor_pool.current_size()
 
         delta = target_concurrency - current_size
+        logger.info(
+            f"Operator {op.name}: current_size={current_size}, "
+            f"target_concurrency={target_concurrency}, delta={delta}"
+        )
 
         if delta == 0:
             logger.debug(
