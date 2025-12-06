@@ -131,9 +131,13 @@ class ActorPoolMapOperator(MapOperator):
             self._ray_remote_args, self.data_context
         )
 
+        # NPU priority: if NPU is set in resources, use it as gpu value
+        resources = self._ray_remote_args.get("resources", {})
+        gpu_value = resources.get("NPU") if "NPU" in resources else self._ray_remote_args.get("num_gpus")
+
         per_actor_resource_usage = ExecutionResources(
             cpu=self._ray_remote_args.get("num_cpus"),
-            gpu=self._ray_remote_args.get("num_gpus"),
+            gpu=gpu_value,
             memory=self._ray_remote_args.get("memory"),
         )
 

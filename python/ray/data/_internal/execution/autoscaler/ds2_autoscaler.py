@@ -51,7 +51,11 @@ class DS2Autoscaler(Autoscaler):
         logger.info("DS2 autoscaler shutting down.")
 
     def get_total_resources(self) -> ExecutionResources:
-        return ExecutionResources.from_resource_dict(ray.cluster_resources()) 
+        cluster_res = ray.cluster_resources()
+        # NPU priority: if NPU exists, use it as GPU
+        if "NPU" in cluster_res:
+            cluster_res["GPU"] = cluster_res["NPU"]
+        return ExecutionResources.from_resource_dict(cluster_res)
 
     def ds2_scaling(self):
         """Perform DS2 autoscaling based on MILP solver results.
