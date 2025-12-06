@@ -36,7 +36,7 @@ class DS2Autoscaler(Autoscaler):
         super().__init__(topology, resource_manager, execution_id)
 
         # Last time when DS2 scaling was triggered.
-        self._last_scaling_time = 0
+        self._last_scaling_time = time.time()
 
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
@@ -71,35 +71,50 @@ class DS2Autoscaler(Autoscaler):
             )
             return
 
-        # Collect metrics from all ActorPoolMapOperators
+        # First, check if all operators have started processing
+        # Use total cumulative values (without updating EMA) to avoid polluting EMA during cold start
         wall_time_list = self.get_wall_time()
-        logger.debug(f"Wall time list: {wall_time_list}")
-        num_processed_rows_list = self.get_num_processed_rows()
-        logger.debug(f"Num processed rows list: {num_processed_rows_list}")
-        per_actor_resource_usage_list = self.get_per_actor_resource_usage()
-        logger.debug(f"Per actor resource usage list: {per_actor_resource_usage_list}")
-        total_resources = self.get_total_resources()
-        logger.debug(f"Total resources: {total_resources}")
-        n = len(wall_time_list)
+        logger.debug(f"Total wall time list: {wall_time_list}")
 
+        n = len(wall_time_list)
         if n == 0:
             logger.debug("No ActorPoolMapOperators found. Skipping DS2 autoscaling.")
             return
 
-        # Calculate unit throughput for each operator
-        unit_throughput_list = []
-        all_work = True
-        for wall_time, num_rows in zip(wall_time_list, num_processed_rows_list):
-            if wall_time > 0:
-                unit_throughput_list.append(num_rows / wall_time)
-            else:
-                all_work = False
+        # Check if all operators have processed data
+        all_work = all(wall_time > 0 for wall_time in wall_time_list)
 
         if not all_work:
             logger.info(
                 "Not all operators have processed data yet. Skipping DS2 autoscaling."
             )
             return
+
+        # All operators are working, now collect EMA-smoothed metrics
+        # This updates the EMA values and last snapshots
+        ema_wall_time_list = self.get_ema_wall_time()
+        logger.debug(f"EMA wall time list: {ema_wall_time_list}")
+        ema_num_processed_rows_list = self.get_ema_num_processed_rows()
+        logger.debug(f"EMA num processed rows list: {ema_num_processed_rows_list}")
+
+        per_actor_resource_usage_list = self.get_per_actor_resource_usage()
+        logger.debug(f"Per actor resource usage list: {per_actor_resource_usage_list}")
+        total_resources = self.get_total_resources()
+        logger.debug(f"Total resources: {total_resources}")
+
+        # Calculate unit throughput for each operator using EMA values
+        unit_throughput_list = []
+        for wall_time, num_rows in zip(ema_wall_time_list, ema_num_processed_rows_list):
+            if wall_time > 0:
+                unit_throughput_list.append(num_rows / wall_time)
+            else:
+                # This should not happen since we already checked all_work
+                # But keep it for safety
+                logger.warning(
+                    f"EMA wall time is 0 for an operator. This should not happen. "
+                    f"Skipping DS2 autoscaling."
+                )
+                raise ValueError("EMA wall time is 0 for an operator")
 
         # Extract CPU and GPU usage
         cpu_usage_list = []
@@ -128,7 +143,7 @@ class DS2Autoscaler(Autoscaler):
         # Call MILP solver to get optimal concurrency
         concurrency_list = milp_solver(
             n, unit_throughput_list, cpu_usage_list, gpu_usage_list,
-            num_processed_rows_list, D_o, N_cpu, N_gpu,
+            ema_num_processed_rows_list, D_o, N_cpu, N_gpu,
         )
 
         if concurrency_list is None:
@@ -233,11 +248,46 @@ class DS2Autoscaler(Autoscaler):
                 # )
 
     def get_wall_time(self) -> List[float]:
-        """Get smoothed wall time for each operator using EMA.
+        """Get total cumulative wall time for each operator.
+
+        Returns the total block_generation_time (cumulative since operator start).
+        This is used to check if operators have started processing (value > 0).
+        Does NOT update any metrics.
+
+        Returns:
+            List of total wall time values for each ActorPoolMapOperator.
+        """
+        wall_time_list = []
+        for op in self._topology:
+            if isinstance(op, ActorPoolMapOperator):
+                wall_time_list.append(op._metrics.block_generation_time)
+        return wall_time_list
+
+    def get_num_processed_rows(self) -> List[int]:
+        """Get total cumulative number of processed rows for each operator.
+
+        Returns the total rows_task_inputs_processed (cumulative since operator start).
+        This is used to check if operators have started processing (value > 0).
+        Does NOT update any metrics.
+
+        Returns:
+            List of total processed row counts for each ActorPoolMapOperator.
+        """
+        num_processed_rows_list = []
+        for op in self._topology:
+            if isinstance(op, ActorPoolMapOperator):
+                num_processed_rows_list.append(op._metrics.rows_task_inputs_processed)
+        return num_processed_rows_list
+
+    def get_ema_wall_time(self) -> List[float]:
+        """Get EMA-smoothed wall time for each operator and update metrics.
 
         Computes the exponential moving average (EMA) of wall time deltas
         to smooth out short-term fluctuations and provide a more stable
         estimate of operator throughput.
+
+        This method should only be called after all operators have started
+        processing (i.e., after all_work check passes).
 
         Returns:
             List of EMA-smoothed wall time values for each ActorPoolMapOperator.
@@ -270,12 +320,15 @@ class DS2Autoscaler(Autoscaler):
 
         return wall_time_list
 
-    def get_num_processed_rows(self) -> List[int]:
-        """Get smoothed number of processed rows for each operator using EMA.
+    def get_ema_num_processed_rows(self) -> List[int]:
+        """Get EMA-smoothed number of processed rows for each operator and update metrics.
 
         Computes the exponential moving average (EMA) of processed rows deltas
         to smooth out short-term fluctuations and provide a more stable
         estimate of operator throughput.
+
+        This method should only be called after all operators have started
+        processing (i.e., after all_work check passes).
 
         Returns:
             List of EMA-smoothed processed row counts for each ActorPoolMapOperator.
@@ -308,7 +361,7 @@ class DS2Autoscaler(Autoscaler):
                 num_processed_rows_list.append(int(round(ema_rows)))
 
         return num_processed_rows_list
-    
+
     def get_per_actor_resource_usage(self) -> List[ExecutionResources]:
         per_actor_resource_usage_list = []
         for op in self._topology:
