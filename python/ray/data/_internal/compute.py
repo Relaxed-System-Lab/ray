@@ -1,9 +1,11 @@
 import logging
-from typing import Any, Callable, Iterable, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, TypeVar, Union
 
-from ray.data._internal.execution.interfaces import TaskContext
 from ray.data.block import Block, UserDefinedFunction
 from ray.util.annotations import DeveloperAPI
+
+if TYPE_CHECKING:
+    from ray.data._internal.execution.interfaces import TaskContext
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +19,8 @@ BlockTransform = Union[
     # transform type.
     # Callable[[Block, ...], Iterable[Block]]
     # Callable[[Block, UserDefinedFunction, ...], Iterable[Block]],
-    Callable[[Iterable[Block], TaskContext], Iterable[Block]],
-    Callable[[Iterable[Block], TaskContext, UserDefinedFunction], Iterable[Block]],
+    Callable[[Iterable[Block], "TaskContext"], Iterable[Block]],
+    Callable[[Iterable[Block], "TaskContext", UserDefinedFunction], Iterable[Block]],
     Callable[..., Iterable[Block]],
 ]
 

@@ -89,11 +89,6 @@ class DS2Autoscaler(Autoscaler):
                 "Not all operators have processed data yet. Skipping DS2 autoscaling."
             )
             return
-        logger.info(
-            f"DS2 autoscaling: unit throughput = {unit_throughput_list}, "
-            f"num processed rows = {num_processed_rows_list}"
-            f"wall times = {wall_time_list}"
-        )
 
         # All operators are working, now collect EMA-smoothed metrics
         # This updates the EMA values and last snapshots

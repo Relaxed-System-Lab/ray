@@ -3,7 +3,6 @@ from typing import TYPE_CHECKING
 from .autoscaler import Autoscaler
 from .autoscaling_actor_pool import AutoscalingActorPool
 from .default_autoscaler import DefaultAutoscaler
-from .ds2_autoscaler import DS2Autoscaler
 
 if TYPE_CHECKING:
     from ..resource_manager import ResourceManager
@@ -18,12 +17,23 @@ def create_autoscaler(
     *,
     execution_id: str
 ) -> Autoscaler:
+    # Import DS2Autoscaler here to avoid circular import
+    from .ds2_autoscaler import DS2Autoscaler
+
     # Use DS2Autoscaler instead of DefaultAutoscaler
     return DS2Autoscaler(
         topology,
         resource_manager,
         execution_id=execution_id,
     )
+
+
+# Lazy import for DS2Autoscaler to avoid circular import at module level
+def __getattr__(name):
+    if name == "DS2Autoscaler":
+        from .ds2_autoscaler import DS2Autoscaler
+        return DS2Autoscaler
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
