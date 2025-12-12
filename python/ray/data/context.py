@@ -509,6 +509,12 @@ class DataContext:
         default_factory=lambda: list(DEFAULT_RETRIED_IO_ERRORS)
     )
     enable_per_node_metrics: bool = DEFAULT_ENABLE_PER_NODE_METRICS
+    # Enable vLLM throughput prediction using Gaussian Process regression.
+    # When enabled, the DS2 autoscaler will use a GP model to predict vLLM operator
+    # throughput based on workload features (input/output token lengths), instead of
+    # using observed throughput directly. This helps filter out samples where
+    # throughput is limited by upstream sending rate rather than vLLM capacity.
+    enable_vllm_throughput_prediction: bool = False
     override_object_store_memory_limit_fraction: float = None
     memory_usage_poll_interval_s: Optional[float] = 1
     dataset_logger_id: Optional[str] = None

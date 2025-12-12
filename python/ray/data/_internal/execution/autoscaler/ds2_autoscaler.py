@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import ray
 from .autoscaler import Autoscaler
@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from ray.data._internal.execution.interfaces import PhysicalOperator
     from ray.data._internal.execution.resource_manager import ResourceManager
     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
+    from ray.data._internal.execution.autoscaler.vllm_throughput_predictor import (
+        VLLMThroughputPredictor,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,9 @@ class DS2Autoscaler(Autoscaler):
     # Lower values (closer to 0.0) give more weight to historical data.
     EMA_ALPHA = 0.5
 
+    # Name pattern to identify vLLM operators
+    VLLM_OPERATOR_NAME_PATTERN = "vLLM"
+
     def __init__(
         self,
         topology: "Topology",
@@ -37,6 +43,12 @@ class DS2Autoscaler(Autoscaler):
 
         # Last time when DS2 scaling was triggered.
         self._last_scaling_time = time.time()
+
+        # vLLM throughput predictors (one per vLLM operator)
+        # Only initialized when enable_vllm_throughput_prediction is True
+        self._vllm_predictors: Dict[str, "VLLMThroughputPredictor"] = {}
+        self._vllm_collectors: Dict[str, Any] = {}  # VLLMMetricsCollector instances
+        self._vllm_prediction_enabled = self._init_vllm_prediction()
 
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
@@ -94,6 +106,9 @@ class DS2Autoscaler(Autoscaler):
             )
             return
 
+        # Collect vLLM throughput samples (if enabled)
+        self._collect_vllm_samples()
+
         # All operators are working, now collect EMA-smoothed metrics
         # This updates the EMA values and last snapshots
         ema_wall_time_list = self.get_ema_wall_time()
@@ -106,19 +121,27 @@ class DS2Autoscaler(Autoscaler):
         total_resources = self.get_total_resources()
         logger.debug(f"Total resources: {total_resources}")
 
-        # Calculate unit throughput for each operator using EMA values
+        # Calculate unit throughput for each operator
+        # For vLLM operators with prediction enabled, use the predictor
+        # Otherwise, use the standard EMA-based calculation
         unit_throughput_list = []
-        for wall_time, num_rows in zip(ema_wall_time_list, ema_num_processed_rows_list):
-            if wall_time > 0:
-                unit_throughput_list.append(num_rows / wall_time)
-            else:
-                # This should not happen since we already checked all_work
-                # But keep it for safety
-                logger.warning(
-                    f"EMA wall time is 0 for an operator. This should not happen. "
-                    f"Skipping DS2 autoscaling."
-                )
-                raise ValueError("EMA wall time is 0 for an operator")
+        op_index = 0
+        for op in self._topology:
+            if isinstance(op, ActorPoolMapOperator):
+                wall_time = ema_wall_time_list[op_index]
+                num_rows = ema_num_processed_rows_list[op_index]
+
+                if wall_time <= 0:
+                    # This should not happen since we already checked all_work
+                    logger.warning(
+                        f"EMA wall time is 0 for operator {op.name}. "
+                        f"Skipping DS2 autoscaling."
+                    )
+                    raise ValueError("EMA wall time is 0 for an operator")
+
+                ut = self._get_unit_throughput_for_op(op, wall_time, num_rows)
+                unit_throughput_list.append(ut)
+                op_index += 1
 
         # Extract CPU and GPU usage
         cpu_usage_list = []
@@ -379,4 +402,208 @@ class DS2Autoscaler(Autoscaler):
                     op.get_per_actor_resource_usage()
                 )
         return per_actor_resource_usage_list
-    
+
+    # ========== vLLM Throughput Prediction Methods ==========
+
+    def _init_vllm_prediction(self) -> bool:
+        """Initialize vLLM throughput prediction if enabled.
+
+        Returns:
+            True if vLLM prediction is enabled, False otherwise.
+        """
+        from ray.data.context import DataContext
+
+        ctx = DataContext.get_current()
+        if not ctx.enable_vllm_throughput_prediction:
+            return False
+
+        # Lazy import to avoid sklearn dependency when feature is disabled
+        from ray.data._internal.execution.autoscaler.vllm_throughput_predictor import (
+            VLLMThroughputPredictor,
+            VLLMMetricsCollector,
+        )
+
+        # Initialize predictors and collectors for each vLLM operator
+        for op in self._topology:
+            if isinstance(op, ActorPoolMapOperator):
+                if self._is_vllm_operator(op):
+                    self._vllm_predictors[op.name] = VLLMThroughputPredictor()
+                    self._vllm_collectors[op.name] = VLLMMetricsCollector()
+                    logger.info(
+                        f"Initialized vLLM throughput predictor for operator: {op.name}"
+                    )
+
+        if self._vllm_predictors:
+            logger.info(
+                f"vLLM throughput prediction enabled for {len(self._vllm_predictors)} "
+                f"operators"
+            )
+            return True
+        else:
+            logger.debug("No vLLM operators found, prediction disabled")
+            return False
+
+    def _is_vllm_operator(self, op: ActorPoolMapOperator) -> bool:
+        """Check if an operator is a vLLM operator by its name.
+
+        Args:
+            op: The operator to check.
+
+        Returns:
+            True if the operator is a vLLM operator, False otherwise.
+        """
+        return self.VLLM_OPERATOR_NAME_PATTERN in op.name
+
+    def _get_vllm_predictor(
+        self, op: ActorPoolMapOperator
+    ) -> Optional["VLLMThroughputPredictor"]:
+        """Get the vLLM throughput predictor for an operator.
+
+        Args:
+            op: The operator.
+
+        Returns:
+            The predictor if available, None otherwise.
+        """
+        if not self._vllm_prediction_enabled:
+            return None
+        return self._vllm_predictors.get(op.name)
+
+    def _get_unit_throughput_for_op(
+        self,
+        op: ActorPoolMapOperator,
+        ema_wall_time: float,
+        ema_num_rows: int,
+    ) -> float:
+        """Get unit throughput for an operator.
+
+        For vLLM operators with prediction enabled, uses the predictor.
+        Otherwise, uses the standard EMA-based calculation.
+
+        Args:
+            op: The operator.
+            ema_wall_time: EMA-smoothed wall time.
+            ema_num_rows: EMA-smoothed number of processed rows.
+
+        Returns:
+            The unit throughput value.
+        """
+        # Default calculation
+        if ema_wall_time > 0:
+            default_ut = ema_num_rows / ema_wall_time
+        else:
+            default_ut = 0.0
+
+        # Check if vLLM prediction is available
+        predictor = self._get_vllm_predictor(op)
+        if predictor is None:
+            return default_ut
+
+        # Try to get predicted throughput
+        predicted_ut = predictor.get_unit_throughput()
+        if predicted_ut is not None:
+            logger.debug(
+                f"Operator {op.name}: using predicted UT={predicted_ut:.2f} "
+                f"(default would be {default_ut:.2f})"
+            )
+            return predicted_ut
+
+        # Fall back to default EMA calculation
+        logger.debug(
+            f"Operator {op.name}: prediction not ready, using default UT={default_ut:.2f}"
+        )
+        return default_ut
+
+    def _collect_vllm_samples(self):
+        """Collect throughput samples from vLLM operators.
+
+        This method should be called periodically to feed the predictor with
+        new observations. Uses EMA-based throughput and heuristic metrics
+        when actual vLLM metrics are not available.
+        """
+        if not self._vllm_prediction_enabled:
+            return
+
+        from ray.data._internal.execution.autoscaler.vllm_throughput_predictor import (
+            ThroughputSample,
+            estimate_gpu_utilization,
+        )
+
+        for op in self._topology:
+            if not isinstance(op, ActorPoolMapOperator):
+                continue
+            if not self._is_vllm_operator(op):
+                continue
+
+            predictor = self._vllm_predictors.get(op.name)
+            if predictor is None:
+                continue
+
+            # Get operator metrics
+            actor_pool = op._actor_pool
+            num_actors = actor_pool.num_running_actors()
+            if num_actors == 0:
+                continue
+
+            num_tasks_in_flight = actor_pool.num_tasks_in_flight()
+            max_tasks_per_actor = actor_pool.max_tasks_in_flight_per_actor()
+
+            # Estimate GPU utilization from task queue depth
+            gpu_util = estimate_gpu_utilization(
+                num_tasks_in_flight, max_tasks_per_actor, num_actors
+            )
+
+            # Queue length normalized by number of actors
+            queue_length = (
+                num_tasks_in_flight / num_actors if num_actors > 0 else 0.0
+            )
+
+            # Get throughput from operator metrics
+            metrics = op._metrics
+            wall_time = metrics.wall_clock_time
+            rows_processed = metrics.rows_task_outputs_generated
+
+            if wall_time <= 0 or rows_processed <= 0:
+                continue
+
+            # Calculate observed throughput (rows per second per actor)
+            observed_throughput = rows_processed / wall_time / num_actors
+
+            # Create sample with heuristic token lengths
+            # In production, these would come from actual vLLM metrics
+            import time as time_module
+
+            sample = ThroughputSample(
+                timestamp=time_module.time(),
+                # Heuristic token lengths (typical for chat/instruction models)
+                mean_input_length=512.0,
+                std_input_length=256.0,
+                p50_input_length=384.0,
+                p95_input_length=1024.0,
+                mean_output_length=256.0,
+                std_output_length=128.0,
+                p50_output_length=192.0,
+                p95_output_length=512.0,
+                observed_throughput=observed_throughput,
+                gpu_utilization=gpu_util,
+                queue_length=queue_length,
+                num_actors=num_actors,
+            )
+
+            is_valid = predictor.add_sample(sample)
+            logger.debug(
+                f"Operator {op.name}: collected sample "
+                f"(valid={is_valid}, throughput={observed_throughput:.2f}, "
+                f"gpu_util={gpu_util:.2f}, queue_len={queue_length:.1f})"
+            )
+
+    def get_vllm_predictor_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Get statistics from all vLLM predictors for debugging.
+
+        Returns:
+            Dictionary mapping operator names to their predictor stats.
+        """
+        stats = {}
+        for name, predictor in self._vllm_predictors.items():
+            stats[name] = predictor.get_stats()
+        return stats

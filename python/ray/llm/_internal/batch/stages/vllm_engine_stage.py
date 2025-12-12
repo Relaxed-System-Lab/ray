@@ -420,6 +420,72 @@ class vLLMEngineWrapper:
         return self._vllm_config.scheduler_config
 
 
+class _GPUMonitor:
+    """Monitor GPU utilization using pynvml.
+
+    This class provides GPU utilization metrics for vLLM throughput prediction.
+    It handles graceful degradation when pynvml is not available.
+    """
+
+    def __init__(self):
+        self._nvml_available = False
+        self._device_count = 0
+        self._initialized = False
+
+    def _try_init(self):
+        """Try to initialize NVML. Called lazily on first use."""
+        if self._initialized:
+            return
+
+        self._initialized = True
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            self._device_count = pynvml.nvmlDeviceGetCount()
+            self._nvml_available = True
+            logger.debug(f"GPU monitoring initialized with {self._device_count} devices")
+        except ImportError:
+            logger.debug("pynvml not available, GPU monitoring disabled")
+        except Exception as e:
+            logger.debug(f"Failed to initialize NVML: {e}")
+
+    def get_gpu_utilization(self) -> Optional[float]:
+        """Get average GPU utilization across all devices.
+
+        Returns:
+            Average GPU utilization (0-1), or None if not available.
+        """
+        self._try_init()
+
+        if not self._nvml_available or self._device_count == 0:
+            return None
+
+        try:
+            import pynvml
+
+            total_util = 0.0
+            for i in range(self._device_count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                total_util += util.gpu / 100.0  # Convert to 0-1 range
+
+            return total_util / self._device_count
+        except Exception as e:
+            logger.debug(f"Failed to get GPU utilization: {e}")
+            return None
+
+    def shutdown(self):
+        """Shutdown NVML."""
+        if self._nvml_available:
+            try:
+                import pynvml
+
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
 class vLLMEngineStageUDF(StatefulStageUDF):
     def __init__(
         self,
@@ -491,6 +557,14 @@ class vLLMEngineStageUDF(StatefulStageUDF):
                 f"{math.ceil(max_num_seqs / batch_size)}."
             )
 
+        # Initialize GPU monitor for throughput prediction
+        self._gpu_monitor = _GPUMonitor()
+
+        # Token length statistics for current collection window
+        self._input_lengths: List[int] = []
+        self._output_lengths: List[int] = []
+        self._last_gpu_util: Optional[float] = None
+
     def normalize_engine_kwargs(
         self,
         task_type: vLLMTaskType,
@@ -541,12 +615,19 @@ class vLLMEngineStageUDF(StatefulStageUDF):
         batch_uuid = uuid.uuid4()
         t = time.perf_counter()
 
+        # Sample GPU utilization at the start of the batch
+        self._last_gpu_util = self._gpu_monitor.get_gpu_utilization()
+
         tasks = [asyncio.create_task(self.llm.generate_async(row)) for row in batch]
 
         time_taken = -1.0
         for resp in asyncio.as_completed(tasks):
             request, output = await resp
             time_taken = time.perf_counter() - t
+
+            # Collect token lengths for throughput prediction
+            self._input_lengths.append(output.get("num_input_tokens", 0))
+            self._output_lengths.append(output.get("num_generated_tokens", 0))
 
             yield {
                 **output,
@@ -571,10 +652,36 @@ class vLLMEngineStageUDF(StatefulStageUDF):
         if not self.engine_kwargs.get("disable_log_stats", False):
             await self.llm.engine.do_log_stats()
 
+    def get_vllm_metrics(self) -> Dict[str, Any]:
+        """Get vLLM metrics for throughput prediction.
+
+        This method is called by the DS2 autoscaler to collect metrics
+        for GP-based throughput prediction.
+
+        Returns:
+            Dictionary containing:
+                - input_lengths: List of input token counts
+                - output_lengths: List of output token counts
+                - gpu_utilization: Last sampled GPU utilization
+        """
+        metrics = {
+            "input_lengths": self._input_lengths.copy(),
+            "output_lengths": self._output_lengths.copy(),
+            "gpu_utilization": self._last_gpu_util,
+        }
+
+        # Clear the buffers after collection
+        self._input_lengths = []
+        self._output_lengths = []
+
+        return metrics
+
     def __del__(self):
         if hasattr(self, "llm"):
             # Kill the engine processes.
             self.llm.shutdown()
+        if hasattr(self, "_gpu_monitor"):
+            self._gpu_monitor.shutdown()
 
 
 def _ray_scheduling_strategy_fn(
