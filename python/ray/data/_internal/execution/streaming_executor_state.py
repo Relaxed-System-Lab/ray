@@ -152,6 +152,24 @@ class OpBufferQueue:
             self._num_blocks = 0
             self._num_per_split.clear()
 
+    def num_rows(self) -> Optional[int]:
+        """Return the total number of rows in all bundles in the queue.
+
+        Returns:
+            Total number of rows, or None if any bundle has unknown row count.
+        """
+        with self._lock:
+            main_queue_rows = self._queue.num_rows()
+            if main_queue_rows is None:
+                return None
+            # Also count rows in split queues
+            for split_queue in self._outputs_by_split.values():
+                split_rows = split_queue.num_rows()
+                if split_rows is None:
+                    return None
+                main_queue_rows += split_rows
+            return main_queue_rows
+
 
 @dataclass
 class OpSchedulingStatus:
@@ -253,6 +271,31 @@ class OpState:
         )
 
         return self._pending_dispatch_input_bundles_count() + internal_queue_size
+
+    def total_enqueued_input_rows(self) -> Optional[int]:
+        """Total number of input rows currently enqueued among:
+        1. Input queue(s) pending dispatching (``OpState.input_queues``)
+        2. Operator's internal queues (like ``MapOperator``s ref-bundler, etc)
+
+        Returns:
+            Total number of rows, or None if any bundle has unknown row count.
+        """
+        # Count rows in external input queues
+        external_rows = 0
+        for q in self.input_queues:
+            q_rows = q.num_rows()
+            if q_rows is None:
+                return None
+            external_rows += q_rows
+
+        # Count rows in internal queues
+        internal_rows = 0
+        if isinstance(self.op, InternalQueueOperatorMixin):
+            internal_rows = self.op.internal_queue_num_rows()
+            if internal_rows is None:
+                return None
+
+        return external_rows + internal_rows
 
     def _pending_dispatch_input_bundles_count(self) -> int:
         """Return the number of input bundles that are pending dispatching to the

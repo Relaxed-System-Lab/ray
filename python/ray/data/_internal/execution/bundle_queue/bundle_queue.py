@@ -60,3 +60,12 @@ class BundleQueue(abc.ABC):
         This method is used for testing.
         """
         ...
+
+    @abc.abstractmethod
+    def num_rows(self) -> Optional[int]:
+        """Return the total number of rows in all bundles in the queue.
+
+        Returns:
+            Total number of rows, or None if any bundle has unknown row count.
+        """
+        ...

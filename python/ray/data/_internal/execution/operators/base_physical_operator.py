@@ -16,7 +16,16 @@ from ray.data.context import DataContext
 class InternalQueueOperatorMixin(PhysicalOperator, abc.ABC):
     @abc.abstractmethod
     def internal_queue_size(self) -> int:
-        """Returns Operator's internal queue size"""
+        """Returns Operator's internal queue size (number of bundles)."""
+        ...
+
+    @abc.abstractmethod
+    def internal_queue_num_rows(self) -> Optional[int]:
+        """Returns total number of rows in Operator's internal queue.
+
+        Returns:
+            Total number of rows, or None if any bundle has unknown row count.
+        """
         ...
 
 
@@ -106,6 +115,15 @@ class AllToAllOperator(InternalQueueOperatorMixin, PhysicalOperator):
 
     def internal_queue_size(self) -> int:
         return len(self._input_buffer)
+
+    def internal_queue_num_rows(self) -> Optional[int]:
+        total_rows = 0
+        for bundle in self._input_buffer:
+            bundle_rows = bundle.num_rows()
+            if bundle_rows is None:
+                return None
+            total_rows += bundle_rows
+        return total_rows
 
     def all_inputs_done(self) -> None:
         ctx = TaskContext(

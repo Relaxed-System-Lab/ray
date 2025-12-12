@@ -182,6 +182,18 @@ class ActorPoolMapOperator(MapOperator):
         #   - Own bundle's queue
         return self._block_ref_bundler.num_bundles() + len(self._bundle_queue)
 
+    def internal_queue_num_rows(self) -> Optional[int]:
+        # NOTE: Internal queue rows for ``ActorPoolMapOperator`` includes both
+        #   - Input blocks bundler rows
+        #   - Own bundle queue rows
+        bundler_rows = self._block_ref_bundler.num_rows()
+        if bundler_rows is None:
+            return None
+        bundle_queue_rows = self._bundle_queue.num_rows()
+        if bundle_queue_rows is None:
+            return None
+        return bundler_rows + bundle_queue_rows
+
     def completed(self) -> bool:
         # TODO separate marking as completed from the check
         return (

@@ -1,6 +1,7 @@
 import logging
 import time
-from typing import TYPE_CHECKING, List
+from enum import Enum
+from typing import TYPE_CHECKING, List, Optional
 
 import ray
 from .autoscaler import Autoscaler
@@ -8,6 +9,11 @@ from .autoscaling_actor_pool import ActorPoolScalingRequest
 from ray.data._internal.execution.interfaces.execution_options import ExecutionResources
 from ray.data._internal.execution.operators.actor_pool_map_operator import ActorPoolMapOperator
 from ray.data._internal.execution.autoscaler.ds2_milp_solver import milp_solver
+from ray.data._internal.execution.autoscaler.ds2_milp_solvers import (
+    milp_solver_queue_digestion,
+    milp_solver_relative_deviation,
+    milp_solver_time_unified,
+)
 
 if TYPE_CHECKING:
     from ray.data._internal.execution.interfaces import PhysicalOperator
@@ -15,6 +21,18 @@ if TYPE_CHECKING:
     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
 
 logger = logging.getLogger(__name__)
+
+
+class SolverType(Enum):
+    """Enum for different MILP solver types."""
+    # Original solver without queue size consideration
+    BASIC = "basic"
+    # Algorithm 1: Queue digestion priority - larger queue leads to more parallelism
+    QUEUE_DIGESTION = "queue_digestion"
+    # Algorithm 2: Relative deviation with weights - maintain queue in target range
+    RELATIVE_DEVIATION = "relative_deviation"
+    # Algorithm 3: Time scale unified - maintain queue using unified time scale
+    TIME_UNIFIED = "time_unified"
 
 
 class DS2Autoscaler(Autoscaler):
@@ -26,17 +44,30 @@ class DS2Autoscaler(Autoscaler):
     # Lower values (closer to 0.0) give more weight to historical data.
     EMA_ALPHA = 0.5
 
+    # Default time horizon for planning (seconds)
+    DEFAULT_TIME_HORIZON = 60.0
+
     def __init__(
         self,
         topology: "Topology",
         resource_manager: "ResourceManager",
         *,
         execution_id: str,
+        solver_type: SolverType = SolverType.BASIC,
+        solver_weight: float = 1.0,  # Weight parameter for all solver algorithms
+        time_horizon: Optional[float] = None,  # Planning time horizon
+        target_queue_sizes: Optional[List[float]] = None,  # Target queue sizes (required for non-BASIC solvers)
     ):
         super().__init__(topology, resource_manager, execution_id)
 
         # Last time when DS2 scaling was triggered.
         self._last_scaling_time = time.time()
+
+        # Solver configuration
+        self._solver_type = solver_type
+        self._solver_weight = solver_weight
+        self._time_horizon = time_horizon or self.DEFAULT_TIME_HORIZON
+        self._target_queue_sizes = target_queue_sizes
 
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
@@ -136,18 +167,25 @@ class DS2Autoscaler(Autoscaler):
                 gpu_usage_list.append(per_actor_resource_usage._gpu)
 
         # Get D_o (total rows output generated)
-        D_o = None
+        D_o: float = 0.0
         for op in self._topology:
             if isinstance(op, ActorPoolMapOperator):
-                D_o = op._metrics.rows_task_outputs_generated
+                D_o = float(op._metrics.rows_task_outputs_generated)
 
-        N_cpu = total_resources._cpu
-        N_gpu = total_resources._gpu
+        N_cpu = total_resources._cpu or 0.0
+        N_gpu = total_resources._gpu or 0.0
 
-        # Call MILP solver to get optimal concurrency
-        concurrency_list = milp_solver(
-            n, unit_throughput_list, cpu_usage_list, gpu_usage_list,
-            ema_num_processed_rows_list, D_o, N_cpu, N_gpu,
+        # Call appropriate MILP solver based on solver_type
+        concurrency_list = self._call_solver(
+            n=n,
+            unit_throughput_list=unit_throughput_list,
+            cpu_usage_list=cpu_usage_list,
+            gpu_usage_list=gpu_usage_list,
+            ema_num_processed_rows_list=ema_num_processed_rows_list,
+            ema_wall_time_list=ema_wall_time_list,
+            D_o=D_o,
+            N_cpu=N_cpu,
+            N_gpu=N_gpu,
         )
 
         if concurrency_list is None:
@@ -177,6 +215,135 @@ class DS2Autoscaler(Autoscaler):
 
         # Update last scaling time
         self._last_scaling_time = now
+
+    def _call_solver(
+        self,
+        n: int,
+        unit_throughput_list: List[float],
+        cpu_usage_list: List[float],
+        gpu_usage_list: List[float],
+        ema_num_processed_rows_list: List[int],
+        ema_wall_time_list: List[float],
+        D_o: float,
+        N_cpu: float,
+        N_gpu: float,
+    ) -> Optional[List[int]]:
+        """Call the appropriate MILP solver based on solver_type.
+
+        Args:
+            n: Number of operators
+            unit_throughput_list: Unit throughput for each operator
+            cpu_usage_list: CPU usage per actor for each operator
+            gpu_usage_list: GPU usage per actor for each operator
+            ema_num_processed_rows_list: EMA processed rows (D_i) for each operator
+            ema_wall_time_list: EMA wall time for each operator (for weight calculation)
+            D_o: Total output rows generated
+            N_cpu: Total available CPU
+            N_gpu: Total available GPU
+
+        Returns:
+            List of target concurrency for each operator, or None if solver failed.
+        """
+        D_i = [float(x) for x in ema_num_processed_rows_list]
+
+        if self._solver_type == SolverType.BASIC:
+            # Original solver without queue size consideration
+            return milp_solver(
+                n, unit_throughput_list, cpu_usage_list, gpu_usage_list,
+                ema_num_processed_rows_list, D_o, N_cpu, N_gpu,
+            )
+
+        elif self._solver_type == SolverType.QUEUE_DIGESTION:
+            # Algorithm 1: Queue digestion priority
+            Q = self.get_queue_sizes()
+            Q_target = self.get_target_queue_sizes(n)
+
+            # Ensure lists have correct length
+            if len(Q) < n:
+                Q = Q + [0.0] * (n - len(Q))
+
+            logger.debug(
+                f"Queue digestion solver: Q={Q}, Q_target={Q_target}, "
+                f"T={self._time_horizon}, beta={self._solver_weight}"
+            )
+
+            return milp_solver_queue_digestion(
+                n=n,
+                UT=unit_throughput_list,
+                u=cpu_usage_list,
+                g=gpu_usage_list,
+                D_i=D_i,
+                D_o=D_o,
+                N_cpu=N_cpu,
+                N_gpu=N_gpu,
+                Q=Q,
+                Q_target=Q_target,
+                T=self._time_horizon,
+                beta=self._solver_weight,
+            )
+
+        elif self._solver_type == SolverType.RELATIVE_DEVIATION:
+            # Algorithm 2: Relative deviation with weights
+            B_current = self.get_buffer_sizes()
+            B_target = self.get_target_buffer_sizes(n)
+
+            # Ensure lists have correct length
+            if len(B_current) < n:
+                B_current = B_current + [0.0] * (n - len(B_current))
+
+            logger.debug(
+                f"Relative deviation solver: B_current={B_current}, B_target={B_target}, "
+                f"T={self._time_horizon}, alpha={self._solver_weight}"
+            )
+
+            return milp_solver_relative_deviation(
+                n=n,
+                UT=unit_throughput_list,
+                u=cpu_usage_list,
+                g=gpu_usage_list,
+                D_i=D_i,
+                D_o=D_o,
+                N_cpu=N_cpu,
+                N_gpu=N_gpu,
+                B_current=B_current,
+                B_target=B_target,
+                T=self._time_horizon,
+                alpha=self._solver_weight,
+                ema_wall_time=ema_wall_time_list,
+            )
+
+        elif self._solver_type == SolverType.TIME_UNIFIED:
+            # Algorithm 3: Time scale unified
+            B_current = self.get_buffer_sizes()
+            B_target = self.get_target_buffer_sizes(n)
+
+            # Ensure lists have correct length
+            if len(B_current) < n:
+                B_current = B_current + [0.0] * (n - len(B_current))
+
+            logger.debug(
+                f"Time unified solver: B_current={B_current}, B_target={B_target}, "
+                f"T={self._time_horizon}, alpha={self._solver_weight}"
+            )
+
+            return milp_solver_time_unified(
+                n=n,
+                UT=unit_throughput_list,
+                u=cpu_usage_list,
+                g=gpu_usage_list,
+                D_i=D_i,
+                D_o=D_o,
+                N_cpu=N_cpu,
+                N_gpu=N_gpu,
+                B_current=B_current,
+                B_target=B_target,
+                T=self._time_horizon,
+                alpha=self._solver_weight,
+            )
+
+        else:
+            logger.error(f"Unknown solver type: {self._solver_type}")
+            return None
 
     def _scale_operator(self, op: ActorPoolMapOperator, target_concurrency: int):
         """Scale an operator's actor pool to match the target concurrency.
@@ -379,4 +546,104 @@ class DS2Autoscaler(Autoscaler):
                     op.get_per_actor_resource_usage()
                 )
         return per_actor_resource_usage_list
-    
+
+    def _estimate_avg_rows_per_bundle(self, op: ActorPoolMapOperator) -> float:
+        """Estimate average rows per bundle for an operator.
+
+        Uses metrics from processed inputs to estimate. If no data is available,
+        returns a default value of 1.0 (treating bundles as rows).
+
+        Args:
+            op: The operator to estimate for.
+
+        Returns:
+            Estimated average rows per bundle.
+        """
+        metrics = op.metrics
+        # Use processed inputs to estimate avg rows per bundle
+        if metrics.num_task_inputs_processed > 0 and metrics.rows_task_inputs_processed > 0:
+            return metrics.rows_task_inputs_processed / metrics.num_task_inputs_processed
+        # Fallback: if no processed data yet, return 1.0 (bundle count = row count estimate)
+        return 1.0
+
+    def get_queue_sizes(self) -> List[float]:
+        """Get current queue sizes in rows for each operator.
+
+        This iterates through all bundles in the queues to get the exact row count.
+        The queue includes both external input queues and internal operator queues.
+
+        This ensures the queue size unit (rows) matches the throughput unit (rows/s).
+
+        Returns:
+            List of queue sizes in rows for each ActorPoolMapOperator.
+            Falls back to estimated value if exact row count is unavailable.
+        """
+        queue_sizes = []
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator):
+                # Try to get exact row count by iterating bundles
+                exact_rows = op_state.total_enqueued_input_rows()
+                if exact_rows is not None:
+                    queue_sizes.append(float(exact_rows))
+                else:
+                    # Fallback to estimation if any bundle has unknown row count
+                    num_bundles = op_state.total_enqueued_input_bundles()
+                    avg_rows_per_bundle = self._estimate_avg_rows_per_bundle(op)
+                    estimated_rows = float(num_bundles) * avg_rows_per_bundle
+                    queue_sizes.append(estimated_rows)
+        return queue_sizes
+
+    def get_buffer_sizes(self) -> List[float]:
+        """Get current input buffer sizes in rows for each operator.
+
+        The buffer B_i represents all inputs (in rows) waiting to be processed
+        by operator i, including both external queues and internal queues.
+
+        This is equivalent to get_queue_sizes() but conceptually represents
+        the buffer between operators in the pipeline.
+
+        Returns:
+            List of input buffer sizes in rows for each ActorPoolMapOperator.
+        """
+        # Buffer size is the same as queue size (both in rows)
+        return self.get_queue_sizes()
+
+    def get_target_queue_sizes(self, n: int) -> List[float]:
+        """Get target queue sizes for each operator.
+
+        Args:
+            n: Number of operators
+
+        Returns:
+            List of target queue sizes for each operator.
+
+        Raises:
+            ValueError: If target_queue_sizes was not specified during initialization.
+        """
+        if self._target_queue_sizes is None:
+            raise ValueError(
+                "target_queue_sizes must be specified during DS2Autoscaler initialization "
+                "when using non-BASIC solver types. Please provide target_queue_sizes parameter."
+            )
+
+        # Extend or truncate to match number of operators
+        if len(self._target_queue_sizes) >= n:
+            return self._target_queue_sizes[:n]
+        else:
+            # Pad with last value
+            last_val = self._target_queue_sizes[-1] if self._target_queue_sizes else 1.0
+            return self._target_queue_sizes + [last_val] * (n - len(self._target_queue_sizes))
+
+    def get_target_buffer_sizes(self, n: int) -> List[float]:
+        """Get target buffer sizes for each operator.
+
+        Target buffer B_target_i represents the desired buffer size between
+        operator i-1 and operator i (input queue for operator i).
+
+        Args:
+            n: Number of operators
+
+        Returns:
+            List of target buffer sizes for each operator.
+        """
+        return self.get_target_queue_sizes(n)

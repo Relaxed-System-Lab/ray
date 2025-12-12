@@ -153,6 +153,9 @@ class MapOperator(OneToOneOperator, InternalQueueOperatorMixin, ABC):
     def internal_queue_size(self) -> int:
         return self._block_ref_bundler.num_bundles()
 
+    def internal_queue_num_rows(self) -> Optional[int]:
+        return self._block_ref_bundler.num_rows()
+
     @property
     def name(self) -> str:
         name = super().name
@@ -602,6 +605,20 @@ class _BlockRefBundler:
 
     def num_bundles(self):
         return len(self._bundle_buffer)
+
+    def num_rows(self) -> Optional[int]:
+        """Returns total number of rows in the bundler's buffer.
+
+        Returns:
+            Total number of rows, or None if any bundle has unknown row count.
+        """
+        total_rows = 0
+        for bundle in self._bundle_buffer:
+            bundle_rows = bundle.num_rows()
+            if bundle_rows is None:
+                return None
+            total_rows += bundle_rows
+        return total_rows
 
     def add_bundle(self, bundle: RefBundle):
         """Add a bundle to the bundler."""

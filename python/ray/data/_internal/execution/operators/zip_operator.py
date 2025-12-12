@@ -78,6 +78,20 @@ class ZipOperator(InternalQueueOperatorMixin, PhysicalOperator):
     def internal_queue_size(self) -> int:
         return len(self._left_buffer) + len(self._right_buffer)
 
+    def internal_queue_num_rows(self) -> Optional[int]:
+        total_rows = 0
+        for bundle in self._left_buffer:
+            bundle_rows = bundle.num_rows()
+            if bundle_rows is None:
+                return None
+            total_rows += bundle_rows
+        for bundle in self._right_buffer:
+            bundle_rows = bundle.num_rows()
+            if bundle_rows is None:
+                return None
+            total_rows += bundle_rows
+        return total_rows
+
     def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
         assert not self.completed()
         assert input_index == 0 or input_index == 1, input_index

@@ -127,3 +127,17 @@ class FIFOBundleQueue(BundleQueue):
 
     def is_empty(self):
         return not self._bundle_to_nodes and self._head is None and self._tail is None
+
+    def num_rows(self) -> Optional[int]:
+        """Return the total number of rows in all bundles in the queue.
+
+        Returns:
+            Total number of rows, or None if any bundle has unknown row count.
+        """
+        total_rows = 0
+        for bundle in self._bundle_to_nodes.keys():
+            bundle_rows = bundle.num_rows()
+            if bundle_rows is None:
+                return None
+            total_rows += bundle_rows
+        return total_rows
