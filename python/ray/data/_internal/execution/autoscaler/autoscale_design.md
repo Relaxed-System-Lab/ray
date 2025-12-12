@@ -37,6 +37,30 @@ $$
 | 1 | 两者同等重要 |
 | 2 | 队列消化权重是吞吐量的 2 倍 |
 
+## 让Q_{target} 为0
+
+### 简化后的模型
+
+$$
+\begin{aligned}
+\max \quad & \frac{\tau}{\tau^{ref}} + \beta \cdot \frac{\sum_{i=1}^{n} d_i}{D^{ref}} \\[2ex]
+\text{s.t.} \quad & \tau + \frac{D_o}{D_i} \cdot \frac{d_i}{T} \leq \frac{D_o}{D_i} \cdot p_i \cdot UT_i, && \forall i \\[1ex]
+& 0 \leq d_i \leq Q_i, && \forall i \\[1ex]
+& \sum_{i=1}^{n} u_i \cdot p_i \leq N_{cpu} \\[1ex]
+& \sum_{i=1}^{n} m_i \cdot p_i \leq M_{mem} \\[1ex]
+& \sum_{i=1}^{n} g_i \cdot p_i \leq N_{gpu} \\[1ex]
+& p_i \in \mathbb{Z}^+, \quad d_i \geq 0, \quad \tau \geq 0
+\end{aligned}
+$$
+
+### 归一化参考值
+
+$\tau^{ref} = \min_{i} \left( \frac{D_o}{D_i} \cdot UT_i \cdot p_i^{max} \right)$
+
+$D^{ref} = \sum_{i=1}^{n}$
+
+简化后目标就是尽可能把队列清空到 0，约束也更简洁了。
+
 ## 维持queue size在固定范围
 
 ### 决策变量

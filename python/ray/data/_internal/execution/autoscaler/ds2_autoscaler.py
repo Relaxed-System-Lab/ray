@@ -254,16 +254,15 @@ class DS2Autoscaler(Autoscaler):
             )
 
         elif self._solver_type == SolverType.QUEUE_DIGESTION:
-            # Algorithm 1: Queue digestion priority
+            # Algorithm 1: Queue digestion priority (Q_target = 0)
             Q = self.get_queue_sizes()
-            Q_target = self.get_target_queue_sizes(n)
 
             # Ensure lists have correct length
             if len(Q) < n:
                 Q = Q + [0.0] * (n - len(Q))
 
             logger.debug(
-                f"Queue digestion solver: Q={Q}, Q_target={Q_target}, "
+                f"Queue digestion solver: Q={Q}, "
                 f"T={self._time_horizon}, beta={self._solver_weight}"
             )
 
@@ -277,7 +276,6 @@ class DS2Autoscaler(Autoscaler):
                 N_cpu=N_cpu,
                 N_gpu=N_gpu,
                 Q=Q,
-                Q_target=Q_target,
                 T=self._time_horizon,
                 beta=self._solver_weight,
             )

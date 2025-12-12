@@ -24,26 +24,26 @@ def milp_solver_queue_digestion(
     N_cpu: float,     # Total available CPU
     N_gpu: float,     # Total available GPU
     Q: List[float],   # Current queue size for each operator
-    Q_target: List[float],  # Target queue size for each operator
     T: float,         # Time horizon for planning
     beta: float = 1.0,  # Weight for queue digestion term
 ) -> Optional[List[int]]:
     """
-    Algorithm 1: Queue Digestion Priority MILP Solver.
-    
+    Algorithm 1: Queue Digestion Priority MILP Solver (Simplified with Q_target = 0).
+
     Objective: max τ/τ_ref + β * Σd_i/D_ref
-    
+
     Where:
     - τ is system throughput
     - d_i is queue digestion amount for operator i
     - τ_ref is reference throughput for normalization
-    - D_ref is reference digestion amount for normalization
-    
+    - D_ref = Σ Q_i (total queue size, since Q_target = 0)
+
     The larger the queue size, the more parallelism is allocated.
+    Goal is to drain the queues to 0.
     """
     if n == 0:
         return []
-    
+
     # --- Calculate reference values for normalization ---
     # p_max for each operator (theoretical max parallelism under resource constraints)
     p_max = []
@@ -51,7 +51,7 @@ def milp_solver_queue_digestion(
         cpu_limit = N_cpu / u[i] if u[i] > 0 else float('inf')
         gpu_limit = N_gpu / g[i] if g[i] > 0 else float('inf')
         p_max.append(min(cpu_limit, gpu_limit))
-    
+
     # τ_ref = min_i(D_o/D_i * UT_i * p_i_max)
     tau_ref_candidates = []
     for i in range(n):
@@ -60,22 +60,22 @@ def milp_solver_queue_digestion(
             tau_ref_candidates.append(scaling_factor * UT[i] * p_max[i])
     tau_ref = min(tau_ref_candidates) if tau_ref_candidates else 1.0
     tau_ref = max(tau_ref, 1e-6)  # Avoid division by zero
-    
-    # D_ref = Σmax(0, Q_i - Q_target_i)
-    D_ref = sum(max(0, Q[i] - Q_target[i]) for i in range(n))
+
+    # D_ref = Σ Q_i (with Q_target = 0)
+    D_ref = sum(Q[i] for i in range(n))
     D_ref = max(D_ref, 1e-6)  # Avoid division by zero
-    
+
     # --- Variables ---
     p = LpVariable.dicts("p", range(n), lowBound=1, cat='Integer')
     tau = LpVariable("tau", lowBound=0)
     d = LpVariable.dicts("d", range(n), lowBound=0)  # Queue digestion amount
-    
+
     # --- Problem ---
     prob = LpProblem("Queue_Digestion_Priority", LpMaximize)
-    
+
     # --- Objective: max τ/τ_ref + β * Σd_i/D_ref ---
     prob += tau / tau_ref + beta * lpSum([d[i] for i in range(n)]) / D_ref
-    
+
     # --- Constraints ---
     # 1. Throughput constraint: τ + (D_o/D_i) * d_i/T <= (D_o/D_i) * p_i * UT_i
     for i in range(n):
@@ -83,11 +83,10 @@ def milp_solver_queue_digestion(
             scaling_factor = D_o / D_i[i]
             prob += tau + scaling_factor * d[i] / T <= scaling_factor * p[i] * UT[i], \
                 f"Throughput_Constraint_{i}"
-    
-    # 2. Queue digestion bound: 0 <= d_i <= max(0, Q_i - Q_target_i)
+
+    # 2. Queue digestion bound: 0 <= d_i <= Q_i (with Q_target = 0)
     for i in range(n):
-        max_digestion = max(0, Q[i] - Q_target[i])
-        prob += d[i] <= max_digestion, f"Queue_Digestion_Upper_Bound_{i}"
+        prob += d[i] <= Q[i], f"Queue_Digestion_Upper_Bound_{i}"
     
     # 3. Resource constraints
     prob += lpSum([u[i] * p[i] for i in range(n)]) <= N_cpu, "CPU_Constraint"
