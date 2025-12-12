@@ -74,14 +74,15 @@ def milp_solver_queue_digestion(
     prob = LpProblem("Queue_Digestion_Priority", LpMaximize)
 
     # --- Objective: max τ/τ_ref + β * Σd_i/D_ref ---
-    prob += tau / tau_ref + beta * lpSum([d[i] for i in range(n)]) / D_ref
+    # Note: PuLP doesn't support LpVariable / float, so we multiply by inverse
+    prob += tau * (1.0 / tau_ref) + beta * lpSum([d[i] for i in range(n)]) * (1.0 / D_ref)
 
     # --- Constraints ---
     # 1. Throughput constraint: τ + (D_o/D_i) * d_i/T <= (D_o/D_i) * p_i * UT_i
     for i in range(n):
         if D_i[i] > 0:
             scaling_factor = D_o / D_i[i]
-            prob += tau + scaling_factor * d[i] / T <= scaling_factor * p[i] * UT[i], \
+            prob += tau + scaling_factor * d[i] * (1.0 / T) <= scaling_factor * p[i] * UT[i], \
                 f"Throughput_Constraint_{i}"
 
     # 2. Queue digestion bound: 0 <= d_i <= Q_i (with Q_target = 0)
@@ -170,11 +171,12 @@ def milp_solver_relative_deviation(
     prob = LpProblem("Relative_Deviation_Weighted", LpMaximize)
 
     # --- Objective: max τ/τ_ref - α * Σw_i * (δ_i+ + δ_i-) / B_target_i ---
+    # Note: PuLP doesn't support LpVariable / float, so we multiply by inverse
     deviation_term = lpSum([
-        w[i] * (delta_plus[i] + delta_minus[i]) / max(B_target[i], 1e-6)
+        w[i] * (delta_plus[i] + delta_minus[i]) * (1.0 / max(B_target[i], 1e-6))
         for i in range(1, n)
     ])
-    prob += tau / tau_ref - alpha * deviation_term
+    prob += tau * (1.0 / tau_ref) - alpha * deviation_term
 
     # --- Constraints ---
     # 1. Throughput constraint: τ <= (D_o/D_i) * p_i * UT_i
@@ -244,8 +246,9 @@ def milp_solver_time_unified(
     prob = LpProblem("Time_Scale_Unified", LpMaximize)
 
     # --- Objective: max τ - α * Σ(δ_i+ + δ_i-) / T ---
+    # Note: PuLP doesn't support LpVariable / float, so we multiply by inverse
     deviation_term = lpSum([
-        (delta_plus[i] + delta_minus[i]) / T
+        (delta_plus[i] + delta_minus[i]) * (1.0 / T)
         for i in range(1, n)
     ])
     prob += tau - alpha * deviation_term
@@ -297,8 +300,7 @@ if __name__ == "__main__":
     N_gpu = 8      # Total available GPUs
 
     # Queue/Buffer parameters
-    Q = [100, 200, 150, 80, 60, 40, 20]  # Current queue size
-    Q_target = [50, 100, 75, 40, 30, 20, 10]  # Target queue size
+    Q = [100, 200, 150, 80, 60, 40, 20]  # Current queue size (Q_target = 0)
 
     B_current = [0, 200, 150, 80, 60, 40, 20]  # Current buffer (first is ignored)
     B_target = [0, 100, 75, 40, 30, 20, 10]    # Target buffer
@@ -309,10 +311,10 @@ if __name__ == "__main__":
     print("Testing MILP Solvers with Queue Size Consideration")
     print("=" * 60)
 
-    # Test Algorithm 1: Queue Digestion Priority
-    print("\n--- Algorithm 1: Queue Digestion Priority ---")
+    # Test Algorithm 1: Queue Digestion Priority (Q_target = 0)
+    print("\n--- Algorithm 1: Queue Digestion Priority (Q_target = 0) ---")
     result1 = milp_solver_queue_digestion(
-        n, UT, u, g, D_i, D_o, N_cpu, N_gpu, Q, Q_target, T, beta=1.0
+        n, UT, u, g, D_i, D_o, N_cpu, N_gpu, Q, T, beta=1.0
     )
     print(f"Result: {result1}")
 
