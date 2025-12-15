@@ -18,13 +18,43 @@ def create_autoscaler(
     execution_id: str
 ) -> Autoscaler:
     # Import DS2Autoscaler here to avoid circular import
-    from .ds2_autoscaler import DS2Autoscaler
+    from .ds2_autoscaler import DS2Autoscaler, SolverType
 
     # Use DS2Autoscaler instead of DefaultAutoscaler
+    # basic
+    # return DS2Autoscaler(
+    #     topology,
+    #     resource_manager,
+    #     execution_id=execution_id,
+    # )
+
+    # queue_digestion
+    # return DS2Autoscaler(
+    #     topology,
+    #     resource_manager,
+    #     execution_id=execution_id,
+    #     solver_type=SolverType.QUEUE_DIGESTION,
+    #     solver_weight=2,
+    # )
+
+    # relative_deviation
+    # return DS2Autoscaler(
+    #     topology,
+    #     resource_manager,
+    #     execution_id=execution_id,
+    #     solver_type=SolverType.RELATIVE_DEVIATION,
+    #     solver_weight=2,
+    #     target_queue_sizes=[20.0] * 9,
+    # )
+
+    # time unified
     return DS2Autoscaler(
         topology,
         resource_manager,
         execution_id=execution_id,
+        solver_type=SolverType.TIME_UNIFIED,
+        solver_weight=2,
+        target_queue_sizes=[256.0] * 9,
     )
 
 
