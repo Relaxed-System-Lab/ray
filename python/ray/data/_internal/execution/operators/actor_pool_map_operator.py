@@ -239,11 +239,15 @@ class ActorPoolMapOperator(MapOperator):
     def should_add_input(self) -> bool:
         return self._actor_pool.num_free_task_slots() > 0
 
-    def _start_actor(self, labels: Dict[str, str]) -> Tuple[ActorHandle, ObjectRef]:
+    def _start_actor(
+        self, labels: Dict[str, str], node_id: Optional[str] = None
+    ) -> Tuple[ActorHandle, ObjectRef]:
         """Start a new actor and add it to the actor pool as a pending actor.
 
         Args:
             labels: The key-value labels to launch the actor with.
+            node_id: If provided, the actor will be placed on this specific node
+                using NodeAffinitySchedulingStrategy.
 
         Returns:
             A tuple of the actor handle and the object ref to the actor's location.
@@ -252,9 +256,20 @@ class ActorPoolMapOperator(MapOperator):
         ctx = self.data_context
         if self._ray_remote_args_fn:
             self._refresh_actor_cls()
-        actor = self._cls.options(
-            _labels={self._OPERATOR_ID_LABEL_KEY: self.id, **labels}
-        ).remote(
+
+        # Build actor options
+        actor_options = {"_labels": {self._OPERATOR_ID_LABEL_KEY: self.id, **labels}}
+
+        # Add node affinity scheduling if node_id is specified
+        if node_id is not None:
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+            actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                node_id=node_id,
+                soft=False,  # Hard constraint: must run on this node
+            )
+
+        actor = self._cls.options(**actor_options).remote(
             ctx,
             src_fn_name=self.name,
             map_transformer=self._map_transformer,
@@ -559,6 +574,9 @@ class _ActorState:
     # Is Actor state restarting or alive
     is_restarting: bool
 
+    # Timestamp when the actor creation was initiated (for startup time tracking)
+    creation_timestamp: Optional[float] = None
+
 
 class _ActorTaskSelector(abc.ABC):
     def __init__(self, actor_pool: "_ActorPool"):
@@ -760,6 +778,17 @@ class _ActorPool(AutoscalingActorPool):
         # Actors marked for removal (will be killed when they complete current tasks)
         self._actors_marked_for_removal: Set[ray.actor.ActorHandle] = set()
 
+        # === Timing tracking for adaptive migration cost estimation ===
+        # Map from pending actor ready_ref to creation timestamp
+        self._pending_actor_creation_times: Dict[ObjectRef, float] = {}
+        # History of observed actor startup times (seconds)
+        # Limited to last _MAX_TIMING_HISTORY_SIZE samples
+        self._actor_startup_times: List[float] = []
+        # History of observed actor shutdown times (seconds)
+        self._actor_shutdown_times: List[float] = []
+        # Maximum number of timing samples to keep per metric
+        self._MAX_TIMING_HISTORY_SIZE: int = 100
+
     # === Overriding methods of AutoscalingActorPool ===
 
     def min_size(self) -> int:
@@ -945,17 +974,171 @@ class _ActorPool(AutoscalingActorPool):
 
         return num_removed, num_marked
 
-    def _create_actor(self) -> Tuple[ray.actor.ActorHandle, ObjectRef]:
+    def _create_actor(
+        self, node_id: Optional[str] = None
+    ) -> Tuple[ray.actor.ActorHandle, ObjectRef]:
+        """Create a new actor, optionally on a specific node.
+
+        Args:
+            node_id: If provided, the actor will be placed on this specific node
+                using NodeAffinitySchedulingStrategy.
+
+        Returns:
+            A tuple of (actor_handle, ready_ref).
+        """
         logical_actor_id = str(uuid.uuid4())
         labels = {self.get_logical_id_label_key(): logical_actor_id}
-        actor, ready_ref = self._create_actor_fn(labels)
+        actor, ready_ref = self._create_actor_fn(labels, node_id=node_id)
         self._actor_to_logical_id[actor] = logical_actor_id
+        # Record creation timestamp for startup time tracking
+        self._pending_actor_creation_times[ready_ref] = time.time()
         return actor, ready_ref
 
     # === End of overriding methods of AutoscalingActorPool ===
 
     def running_actors(self) -> Dict[ray.actor.ActorHandle, _ActorState]:
         return self._running_actors
+
+    # === Node-aware scaling methods for placement-aware autoscaler ===
+
+    def get_actors_by_node(self) -> Dict[str, List[ray.actor.ActorHandle]]:
+        """Get a mapping from node IDs to actors running on each node.
+
+        Returns:
+            Dict mapping node_id to list of actor handles on that node.
+        """
+        result: Dict[str, List[ray.actor.ActorHandle]] = {}
+        for actor, state in self._running_actors.items():
+            node_id = state.actor_location
+            if node_id not in result:
+                result[node_id] = []
+            result[node_id].append(actor)
+        return result
+
+    def get_actor_count_by_node(self) -> Dict[str, int]:
+        """Get the count of running actors on each node.
+
+        Returns:
+            Dict mapping node_id to count of actors on that node.
+        """
+        result: Dict[str, int] = {}
+        for actor, state in self._running_actors.items():
+            node_id = state.actor_location
+            result[node_id] = result.get(node_id, 0) + 1
+        return result
+
+    def scale_on_node(
+        self,
+        node_id: str,
+        num_actors: int,
+        reason: str = "placement-aware scaling",
+    ) -> int:
+        """Scale up by creating actors on a specific node.
+
+        Args:
+            node_id: The Ray node ID where actors should be placed.
+            num_actors: Number of actors to create on this node.
+            reason: Reason for scaling (for logging).
+
+        Returns:
+            Number of actors created.
+        """
+        if num_actors <= 0:
+            return 0
+
+        logger.debug(
+            f"Scaling up {num_actors} actors on node {node_id} "
+            f"(reason={reason}, {self.get_actor_info()})"
+        )
+
+        for _ in range(num_actors):
+            actor, ready_ref = self._create_actor(node_id=node_id)
+            self.add_pending_actor(actor, ready_ref)
+
+        # Capture last scale up timestamp
+        self._last_upscaling_ts = time.time()
+
+        return num_actors
+
+    def scale_down_on_node(
+        self,
+        node_id: str,
+        num_to_remove: int,
+        forced: bool = False,
+    ) -> Tuple[int, int]:
+        """Scale down by removing actors from a specific node.
+
+        This method removes actors specifically from the given node.
+        Inactive actors (idle) are killed immediately, while active actors
+        are either marked for removal (if forced=False) or killed immediately
+        (if forced=True).
+
+        Args:
+            node_id: The Ray node ID from which to remove actors.
+            num_to_remove: Number of actors to remove from this node.
+            forced: If True, active actors will be killed immediately even if
+                they have tasks in flight.
+
+        Returns:
+            A tuple of (num_removed, num_marked) where:
+            - num_removed: The number of actors that were killed immediately.
+            - num_marked: The number of actors that were marked for removal.
+        """
+        if num_to_remove <= 0:
+            return 0, 0
+
+        # Get actors on the target node
+        actors_on_node = [
+            (actor, state)
+            for actor, state in self._running_actors.items()
+            if state.actor_location == node_id
+        ]
+
+        # Sort: inactive (idle) first, then by num_tasks_in_flight ascending
+        actors_on_node.sort(
+            key=lambda x: (x[1].num_tasks_in_flight > 0, x[1].num_tasks_in_flight)
+        )
+
+        num_removed = 0
+        num_marked = 0
+
+        for actor, state in actors_on_node:
+            if num_removed + num_marked >= num_to_remove:
+                break
+
+            if state.num_tasks_in_flight == 0:
+                # Idle actor, kill immediately
+                self._release_running_actor(actor)
+                num_removed += 1
+            elif forced:
+                # Forced mode: kill active actor immediately
+                logger.debug(
+                    f"Force killing actor {self._actor_to_logical_id.get(actor, 'unknown')} "
+                    f"on node {node_id} with {state.num_tasks_in_flight} tasks in flight"
+                )
+                self._release_running_actor(actor)
+                num_removed += 1
+            else:
+                # Normal mode: mark active actor for removal
+                if actor not in self._actors_marked_for_removal:
+                    self._actors_marked_for_removal.add(actor)
+                    num_marked += 1
+                    logger.debug(
+                        f"Marked actor {self._actor_to_logical_id.get(actor, 'unknown')} "
+                        f"on node {node_id} for removal "
+                        f"(num_tasks_in_flight={state.num_tasks_in_flight})"
+                    )
+
+        if num_removed > 0 or num_marked > 0:
+            logger.debug(
+                f"scale_down_on_node({node_id}): removed {num_removed} actors immediately, "
+                f"marked {num_marked} actors for removal "
+                f"(target={num_to_remove}, forced={forced}, {self.get_actor_info()})"
+            )
+
+        return num_removed, num_marked
+
+    # === End of node-aware scaling methods ===
 
     def on_task_submitted(self, actor: ray.actor.ActorHandle):
         self._running_actors[actor].num_tasks_in_flight += 1
@@ -1008,12 +1191,27 @@ class _ActorPool(AutoscalingActorPool):
         """
         if ready_ref not in self._pending_actors:
             # The actor has been removed from the pool before becoming running.
+            # Clean up timing tracking if present
+            self._pending_actor_creation_times.pop(ready_ref, None)
             return False
+
         actor = self._pending_actors.pop(ready_ref)
+
+        # Calculate and record startup time
+        creation_time = self._pending_actor_creation_times.pop(ready_ref, None)
+        startup_time = None
+        if creation_time is not None:
+            startup_time = time.time() - creation_time
+            # Record in history, maintaining max size
+            self._actor_startup_times.append(startup_time)
+            if len(self._actor_startup_times) > self._MAX_TIMING_HISTORY_SIZE:
+                self._actor_startup_times.pop(0)
+
         self._running_actors[actor] = _ActorState(
             num_tasks_in_flight=0,
             actor_location=ray.get(ready_ref),
             is_restarting=False,
+            creation_timestamp=creation_time,
         )
         return True
 
@@ -1091,6 +1289,8 @@ class _ActorPool(AutoscalingActorPool):
             ready_ref = next(iter(self._pending_actors.keys()))
             actor = self._pending_actors.pop(ready_ref)
             del self._actor_to_logical_id[actor]
+            # Clean up timing tracking
+            self._pending_actor_creation_times.pop(ready_ref, None)
             return True
         # No pending actors, so indicate to the caller that no actors were killed.
         return False
@@ -1182,7 +1382,62 @@ class _ActorPool(AutoscalingActorPool):
         del self._running_actors[actor]
         del self._actor_to_logical_id[actor]
 
+        # Record a default shutdown time estimate.
+        # Since shutdown is asynchronous (we don't wait for completion), we use
+        # a conservative default estimate. This can be improved if we track
+        # actual shutdown completion times in the future.
+        self._record_shutdown_time(self._DEFAULT_SHUTDOWN_TIME_ESTIMATE_S)
+
         return ref
+
+    # Default shutdown time estimate (seconds)
+    _DEFAULT_SHUTDOWN_TIME_ESTIMATE_S: float = 0.5
+
+    def _record_shutdown_time(self, shutdown_time: float):
+        """Record an observed actor shutdown time.
+
+        Args:
+            shutdown_time: The shutdown time in seconds.
+        """
+        self._actor_shutdown_times.append(shutdown_time)
+        if len(self._actor_shutdown_times) > self._MAX_TIMING_HISTORY_SIZE:
+            self._actor_shutdown_times.pop(0)
+
+    def get_observed_startup_cost(self) -> Optional[float]:
+        """Get the simple moving average of observed actor startup times.
+
+        Returns:
+            The average startup time in seconds, or None if no data available.
+        """
+        if len(self._actor_startup_times) == 0:
+            return None
+        return sum(self._actor_startup_times) / len(self._actor_startup_times)
+
+    def get_observed_shutdown_cost(self) -> Optional[float]:
+        """Get the simple moving average of observed actor shutdown times.
+
+        Returns:
+            The average shutdown time in seconds, or None if no data available.
+        """
+        if len(self._actor_shutdown_times) == 0:
+            return None
+        return sum(self._actor_shutdown_times) / len(self._actor_shutdown_times)
+
+    def get_startup_time_samples(self) -> List[float]:
+        """Get the list of observed startup time samples.
+
+        Returns:
+            List of startup times in seconds.
+        """
+        return list(self._actor_startup_times)
+
+    def get_shutdown_time_samples(self) -> List[float]:
+        """Get the list of observed shutdown time samples.
+
+        Returns:
+            List of shutdown times in seconds.
+        """
+        return list(self._actor_shutdown_times)
 
     def get_actor_info(self) -> _ActorPoolInfo:
         """Returns current snapshot of actors' being used in the pool"""
