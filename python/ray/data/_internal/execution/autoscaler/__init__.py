@@ -22,11 +22,11 @@ def create_autoscaler(
 
     # Use DS2Autoscaler instead of DefaultAutoscaler
     # basic
-    # return DS2Autoscaler(
-    #     topology,
-    #     resource_manager,
-    #     execution_id=execution_id,
-    # )
+    return DS2Autoscaler(
+        topology,
+        resource_manager,
+        execution_id=execution_id,
+    )
 
     # queue_digestion
     # return DS2Autoscaler(
@@ -48,14 +48,14 @@ def create_autoscaler(
     # )
 
     # time unified
-    return DS2Autoscaler(
-        topology,
-        resource_manager,
-        execution_id=execution_id,
-        solver_type=SolverType.TIME_UNIFIED,
-        solver_weight=2,
-        target_queue_sizes=[256.0] * 9,
-    )
+    # return DS2Autoscaler(
+    #     topology,
+    #     resource_manager,
+    #     execution_id=execution_id,
+    #     solver_type=SolverType.TIME_UNIFIED,
+    #     solver_weight=2,
+    #     target_queue_sizes=[256.0] * 9,
+    # )
 
 
 # Lazy import for DS2Autoscaler to avoid circular import at module level

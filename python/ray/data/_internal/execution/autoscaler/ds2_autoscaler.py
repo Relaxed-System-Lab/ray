@@ -109,7 +109,9 @@ class DS2Autoscaler(Autoscaler):
         # First, check if all operators have started processing
         # Use total cumulative values (without updating EMA) to avoid polluting EMA during cold start
         wall_time_list = self.get_wall_time()
+        processed_rows_list = self.get_num_processed_rows()
         logger.debug(f"Total wall time list: {wall_time_list}")
+        logger.debug(f"Total processed rows list: {processed_rows_list}")
 
         n = len(wall_time_list)
         if n == 0:
@@ -117,7 +119,8 @@ class DS2Autoscaler(Autoscaler):
             return
 
         # Check if all operators have processed data
-        all_work = all(wall_time > 0 for wall_time in wall_time_list)
+        all_work = all(wall_time > 0 and processed_rows > 0
+                       for wall_time, processed_rows in zip(wall_time_list, processed_rows_list))
 
         if not all_work:
             logger.debug(
@@ -494,7 +497,7 @@ class DS2Autoscaler(Autoscaler):
 
         return wall_time_list
 
-    def get_ema_num_processed_rows(self) -> List[int]:
+    def get_ema_num_processed_rows(self) -> List[float]:
         """Get EMA-smoothed number of processed rows for each operator and update metrics.
 
         Computes the exponential moving average (EMA) of processed rows deltas
@@ -532,7 +535,7 @@ class DS2Autoscaler(Autoscaler):
                 op._metrics.last_rows_task_inputs_processed = current_rows
 
                 # Return as integer (rounded)
-                num_processed_rows_list.append(int(round(ema_rows)))
+                num_processed_rows_list.append(ema_rows)
 
         return num_processed_rows_list
 
