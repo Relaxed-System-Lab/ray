@@ -164,7 +164,7 @@ class RealDS2Autoscaler(Autoscaler):
                 "rows_output": rows_output,
             })
 
-            logger.debug(
+            logger.info(
                 f"Operator {op.name}: output_rate={output_rate:.2f}, "
                 f"processing_ability={processing_ability:.2f}, "
                 f"current_parallelism={current_parallelism}, "
@@ -215,14 +215,11 @@ class RealDS2Autoscaler(Autoscaler):
 
             # Processing ability per instance
             if current_parallelism > 0 and processing_ability > 0:
-                pa_per_instance = processing_ability / current_parallelism
+                # pa_per_instance = processing_ability / current_parallelism
 
                 # Optimal parallelism (Equation 7)
-                if pa_per_instance > 0:
-                    pi = int(math.ceil(upstream_rate / pa_per_instance))
-                    pi = max(1, min(pi, self._max_parallelism))
-                else:
-                    pi = current_parallelism
+                pi = int(math.ceil(upstream_rate / processing_ability))
+                pi = max(1, min(pi, self._max_parallelism))
             else:
                 pi = current_parallelism
 
@@ -234,12 +231,13 @@ class RealDS2Autoscaler(Autoscaler):
                 selectivity = rows_output / rows_input
                 output_rate_star.append(selectivity * upstream_rate)
             else:
-                output_rate_star.append(0.0)
+                # output_rate_star.append(0.0)
+                raise ValueError(f"Operator {i} has zero input rows, cannot compute selectivity.")
 
             logger.debug(
                 f"Operator {i}: upstream_rate={upstream_rate:.2f}, "
-                f"pa_per_instance={processing_ability/current_parallelism if current_parallelism > 0 else 0:.2f}, "
-                f"selectivity={rows_output/rows_input if rows_input > 0 else 0:.4f}, "
+                f"processing_ability={processing_ability}, "
+                f"selectivity={rows_output/rows_input}, "
                 f"optimal_parallelism={pi}"
             )
 
