@@ -56,6 +56,10 @@ class RealDS2Autoscaler(Autoscaler):
         super().__init__(topology, resource_manager, execution_id)
         self._last_scaling_time = time.time()
         self._max_parallelism = max_parallelism
+        # Track last observation time and metrics for delta-based output_rate calculation
+        self._last_observation_time: float = time.time()
+        # Dict: op_name -> last_rows_output
+        self._last_op_metrics: dict = {}
 
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
@@ -132,7 +136,7 @@ class RealDS2Autoscaler(Autoscaler):
         """Collect metrics for each operator.
 
         For DS2, we need:
-        - output_rate: rows output per second
+        - output_rate: rows output per second (based on observation wall time interval)
         - processing_ability: total processing capacity (rows/s) at current parallelism
         - current_parallelism: current number of actors
         - rows_input: total input rows processed
@@ -141,19 +145,28 @@ class RealDS2Autoscaler(Autoscaler):
         Returns:
             List of metrics dict for each operator.
         """
+        now = time.time()
+        observation_interval = now - self._last_observation_time if self._last_observation_time > 0 else 0.0
+
         metrics = []
         for op in operators:
             # Get current parallelism from actor pool
             actor_pools = op.get_autoscaling_actor_pools()
             current_parallelism = actor_pools[0].current_size() if actor_pools else 1
 
-            # Calculate output rate = rows_output / wall_time
-            wall_time = op._metrics.block_generation_time
+            # Get current metric values
             rows_output = op._metrics.rows_task_outputs_generated
-            output_rate = rows_output / wall_time if wall_time > 0 else 0.0
+            rows_input = op._metrics.rows_task_inputs_processed
+            wall_time = op._metrics.block_generation_time
+
+            # Get last observed rows_output
+            last_rows_output = self._last_op_metrics.get(op.name, 0)
+
+            # Calculate output_rate based on observation wall time interval
+            delta_rows_output = rows_output - last_rows_output
+            output_rate = delta_rows_output / observation_interval if observation_interval > 0 else 0.0
 
             # Processing ability = total rows processed / wall_time (this is total capacity)
-            rows_input = op._metrics.rows_task_inputs_processed
             processing_ability = rows_input / wall_time if wall_time > 0 else 0.0
 
             metrics.append({
@@ -168,8 +181,16 @@ class RealDS2Autoscaler(Autoscaler):
                 f"Operator {op.name}: output_rate={output_rate:.2f}, "
                 f"processing_ability={processing_ability:.2f}, "
                 f"current_parallelism={current_parallelism}, "
-                f"rows_input={rows_input}, rows_output={rows_output}"
+                f"rows_input={rows_input}, rows_output={rows_output}, "
+                f"delta_rows_output={delta_rows_output}, "
+                f"observation_interval={observation_interval:.2f}s"
             )
+
+            # Update last observed rows_output for next call
+            self._last_op_metrics[op.name] = rows_output
+
+        # Update last observation time
+        self._last_observation_time = now
 
         return metrics
 
