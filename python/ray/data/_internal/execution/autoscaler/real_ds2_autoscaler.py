@@ -52,11 +52,17 @@ class RealDS2Autoscaler(Autoscaler):
         *,
         execution_id: str,
         max_parallelism: int = 90,
+        use_incremental_output_rate: bool = False,
     ):
         super().__init__(topology, resource_manager, execution_id)
         self._last_scaling_time = time.time()
         self._max_parallelism = max_parallelism
-        # Track last observation time and metrics for delta-based output_rate calculation
+        # If True, use incremental output_rate (delta_rows / observation_interval)
+        # If False (default), use cumulative output_rate (total_rows / total_time)
+        self._use_incremental_output_rate = use_incremental_output_rate
+        # Track start time for cumulative output_rate calculation
+        self._start_time: float = time.time()
+        # Track last observation time and metrics for incremental output_rate calculation
         self._last_observation_time: float = time.time()
         # Dict: op_name -> last_rows_output
         self._last_op_metrics: dict = {}
@@ -136,7 +142,9 @@ class RealDS2Autoscaler(Autoscaler):
         """Collect metrics for each operator.
 
         For DS2, we need:
-        - output_rate: rows output per second (based on observation wall time interval)
+        - output_rate: rows output per second
+          - If use_incremental_output_rate: delta_rows / observation_interval
+          - Otherwise (default): total_rows / total_time_since_start
         - processing_ability: total processing capacity (rows/s) at current parallelism
         - current_parallelism: current number of actors
         - rows_input: total input rows processed
@@ -146,7 +154,8 @@ class RealDS2Autoscaler(Autoscaler):
             List of metrics dict for each operator.
         """
         now = time.time()
-        observation_interval = now - self._last_observation_time if self._last_observation_time > 0 else 0.0
+        total_time = now - self._start_time
+        observation_interval = now - self._last_observation_time
 
         metrics = []
         for op in operators:
@@ -159,12 +168,17 @@ class RealDS2Autoscaler(Autoscaler):
             rows_input = op._metrics.rows_task_inputs_processed
             wall_time = op._metrics.block_generation_time
 
-            # Get last observed rows_output
-            last_rows_output = self._last_op_metrics.get(op.name, 0)
-
-            # Calculate output_rate based on observation wall time interval
-            delta_rows_output = rows_output - last_rows_output
-            output_rate = delta_rows_output / observation_interval if observation_interval > 0 else 0.0
+            # Calculate output_rate
+            if self._use_incremental_output_rate:
+                # Incremental: delta_rows / observation_interval
+                last_rows_output = self._last_op_metrics.get(op.name, 0)
+                delta_rows_output = rows_output - last_rows_output
+                output_rate = delta_rows_output / observation_interval if observation_interval > 0 else 0.0
+                # Update last observed rows_output for next call
+                self._last_op_metrics[op.name] = rows_output
+            else:
+                # Cumulative (default): total_rows / total_time_since_start
+                output_rate = rows_output / total_time if total_time > 0 else 0.0
 
             # Processing ability = total rows processed / wall_time (this is total capacity)
             processing_ability = rows_input / wall_time if wall_time > 0 else 0.0
@@ -181,15 +195,10 @@ class RealDS2Autoscaler(Autoscaler):
                 f"Operator {op.name}: output_rate={output_rate:.2f}, "
                 f"processing_ability={processing_ability:.2f}, "
                 f"current_parallelism={current_parallelism}, "
-                f"rows_input={rows_input}, rows_output={rows_output}, "
-                f"delta_rows_output={delta_rows_output}, "
-                f"observation_interval={observation_interval:.2f}s"
+                f"rows_input={rows_input}, rows_output={rows_output}"
             )
 
-            # Update last observed rows_output for next call
-            self._last_op_metrics[op.name] = rows_output
-
-        # Update last observation time
+        # Update last observation time (for incremental mode)
         self._last_observation_time = now
 
         return metrics
