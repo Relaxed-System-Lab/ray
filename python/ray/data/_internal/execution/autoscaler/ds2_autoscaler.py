@@ -478,6 +478,14 @@ class DS2Autoscaler(Autoscaler):
                 # Calculate the time delta since last call
                 time_delta = current_time - last_time
 
+                # Adjust for max_concurrency overlap:
+                # When max_concurrency > 1, wall_time is accumulated from
+                # concurrent tasks, so we divide by max_concurrency to get
+                # the actual processing time per task.
+                max_concurrency = op._actor_pool._max_actor_concurrency
+                if max_concurrency > 0:
+                    time_delta = time_delta / max_concurrency
+
                 # Apply EMA smoothing
                 if op._metrics.ema_wall_time == 0.0:
                     # First time: initialize EMA with current delta
