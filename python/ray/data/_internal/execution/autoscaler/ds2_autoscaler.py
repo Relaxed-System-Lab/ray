@@ -212,6 +212,15 @@ class DS2Autoscaler(Autoscaler):
                     break
 
                 target_concurrency = concurrency_list[op_index]
+
+                # If operator name contains "BreakByBlock", multiply concurrency by 4
+                if "BreakByBlock" in op.name:
+                    target_concurrency = target_concurrency * 4
+                    logger.info(
+                        f"Operator {op.name} contains 'BreakByBlock', "
+                        f"multiplying concurrency by 4: {concurrency_list[op_index]} -> {target_concurrency}"
+                    )
+
                 self._scale_operator(op, target_concurrency)
 
                 op_index += 1
