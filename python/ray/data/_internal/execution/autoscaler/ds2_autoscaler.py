@@ -202,8 +202,16 @@ class DS2Autoscaler(Autoscaler):
 
         # Apply scaling to each operator
         op_index = 0
-        for op in self._topology:
+        for op, op_state in self._topology.items():
             if isinstance(op, ActorPoolMapOperator):
+                # For completed operators, set concurrency to 0
+                if op.completed() or (
+                    op._inputs_complete and op_state.total_enqueued_input_bundles() == 0
+                ):
+                    logger.info(f"Operator {op.name} is completed, scaling down to 0.")
+                    self._scale_operator(op, target_concurrency=0)
+                    continue
+
                 if op_index >= len(concurrency_list):
                     logger.warning(
                         f"Not enough concurrency values from MILP solver. "
@@ -234,7 +242,7 @@ class DS2Autoscaler(Autoscaler):
         unit_throughput_list: List[float],
         cpu_usage_list: List[float],
         gpu_usage_list: List[float],
-        ema_num_processed_rows_list: List[int],
+        ema_num_processed_rows_list: List[float],
         ema_wall_time_list: List[float],
         D_o: float,
         N_cpu: float,
@@ -433,6 +441,19 @@ class DS2Autoscaler(Autoscaler):
                 #     )
                 # )
 
+    def _is_op_completed(self, op: "PhysicalOperator", op_state: "OpState") -> bool:
+        """Check if an operator has completed processing.
+
+        An operator is considered completed if:
+        - op.completed() returns True, OR
+        - All inputs are complete AND no bundles are enqueued
+
+        This is consistent with the logic in default_autoscaler.py.
+        """
+        return op.completed() or (
+            op._inputs_complete and op_state.total_enqueued_input_bundles() == 0
+        )
+
     def get_wall_time(self) -> List[float]:
         """Get total cumulative wall time for each operator.
 
@@ -444,8 +465,8 @@ class DS2Autoscaler(Autoscaler):
             List of total wall time values for each ActorPoolMapOperator.
         """
         wall_time_list = []
-        for op in self._topology:
-            if isinstance(op, ActorPoolMapOperator):
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 wall_time_list.append(op._metrics.block_generation_time)
         return wall_time_list
 
@@ -460,8 +481,8 @@ class DS2Autoscaler(Autoscaler):
             List of total processed row counts for each ActorPoolMapOperator.
         """
         num_processed_rows_list = []
-        for op in self._topology:
-            if isinstance(op, ActorPoolMapOperator):
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 num_processed_rows_list.append(op._metrics.rows_task_inputs_processed)
         return num_processed_rows_list
 
@@ -479,8 +500,8 @@ class DS2Autoscaler(Autoscaler):
             List of EMA-smoothed wall time values for each ActorPoolMapOperator.
         """
         wall_time_list = []
-        for op in self._topology:
-            if isinstance(op, ActorPoolMapOperator):
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 current_time = op._metrics.block_generation_time
                 last_time = op._metrics.last_block_generation_time
 
@@ -528,8 +549,8 @@ class DS2Autoscaler(Autoscaler):
             List of EMA-smoothed processed row counts for each ActorPoolMapOperator.
         """
         num_processed_rows_list = []
-        for op in self._topology:
-            if isinstance(op, ActorPoolMapOperator):
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 current_rows = op._metrics.rows_task_inputs_processed
                 last_rows = op._metrics.last_rows_task_inputs_processed
 
@@ -558,8 +579,8 @@ class DS2Autoscaler(Autoscaler):
 
     def get_per_actor_resource_usage(self) -> List[ExecutionResources]:
         per_actor_resource_usage_list = []
-        for op in self._topology:
-            if isinstance(op, ActorPoolMapOperator):
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 per_actor_resource_usage_list.append(
                     op.get_per_actor_resource_usage()
                 )
@@ -598,7 +619,7 @@ class DS2Autoscaler(Autoscaler):
         """
         queue_sizes = []
         for op, op_state in self._topology.items():
-            if isinstance(op, ActorPoolMapOperator):
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 # Try to get exact row count by iterating bundles
                 exact_rows = op_state.total_enqueued_input_rows()
                 if exact_rows is not None:
