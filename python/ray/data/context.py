@@ -253,6 +253,24 @@ class AutoscalingConfig:
         DEFAULT_ACTOR_POOL_UTIL_DOWNSCALING_THRESHOLD
     )
 
+    # Autoscaler type: "default", "ds2", "real_ds2", "conttune"
+    autoscaler_type: str = "default"
+
+    # DS2 autoscaler parameters
+    # Solver type: "BASIC", "QUEUE_DIGESTION", "RELATIVE_DEVIATION", "TIME_UNIFIED"
+    ds2_solver_type: str = "BASIC"
+    ds2_solver_weight: float = 1.0
+    ds2_time_horizon: Optional[float] = None
+    ds2_target_queue_sizes: Optional[List[float]] = None
+
+    # RealDS2 and ContTune autoscaler parameters
+    max_parallelism: int = 90
+    use_incremental_output_rate: bool = False
+
+    # ContTune specific parameters
+    conttune_alpha: int = 3
+    conttune_k: int = 10
+
 
 def _execution_options_factory() -> "ExecutionOptions":
     # Lazily import to avoid circular dependencies.
