@@ -195,6 +195,15 @@ class DS2Autoscaler(Autoscaler):
             logger.warning("MILP solver returned None. Skipping DS2 autoscaling.")
             raise ValueError("MILP solver returned None.")
 
+        RESERVE_CPU_FRACTION = 0.05
+        # Post-processing: scale up CPU-only operators to maximize CPU utilization
+        concurrency_list = self._postprocess_scale_cpu_operators(
+            concurrency_list=concurrency_list,
+            cpu_usage_list=cpu_usage_list,
+            gpu_usage_list=gpu_usage_list,
+            N_cpu=N_cpu*(1 - RESERVE_CPU_FRACTION),
+        )
+
         logger.info(
             f"DS2 autoscaling: target concurrency = {concurrency_list}, "
             f"total resources: CPU={N_cpu}, GPU={N_gpu}"
@@ -362,6 +371,119 @@ class DS2Autoscaler(Autoscaler):
         else:
             logger.error(f"Unknown solver type: {self._solver_type}")
             return None
+
+    def _postprocess_scale_cpu_operators(
+        self,
+        concurrency_list: List[int],
+        cpu_usage_list: List[float],
+        gpu_usage_list: List[float],
+        N_cpu: float,
+    ) -> List[int]:
+        """Post-process MILP results to maximize CPU utilization for CPU-only operators.
+
+        This method:
+        1. Classifies operators into GPU/NPU operators and CPU-only operators
+        2. Calculates CPU resources consumed by GPU/NPU operators
+        3. Proportionally scales up CPU-only operators to use remaining CPU resources
+
+        Args:
+            concurrency_list: List of concurrency values from MILP solver
+            cpu_usage_list: CPU usage per actor for each operator
+            gpu_usage_list: GPU usage per actor for each operator
+            N_cpu: Total available CPU resources
+
+        Returns:
+            Updated concurrency list with scaled CPU-only operators
+        """
+        n = len(concurrency_list)
+        if n == 0:
+            return concurrency_list
+
+        # Step 1: Classify operators into GPU/NPU and CPU-only
+        gpu_operator_indices = []
+        cpu_only_operator_indices = []
+
+        for i in range(n):
+            if gpu_usage_list[i] > 0:
+                gpu_operator_indices.append(i)
+            else:
+                cpu_only_operator_indices.append(i)
+
+        logger.debug(
+            f"Post-processing: GPU/NPU operators: {gpu_operator_indices}, "
+            f"CPU-only operators: {cpu_only_operator_indices}"
+        )
+
+        # If no CPU-only operators, nothing to scale
+        if not cpu_only_operator_indices:
+            logger.debug("No CPU-only operators found. Skipping CPU scaling.")
+            return concurrency_list
+
+        # Step 2: Calculate CPU resources consumed by GPU/NPU operators
+        gpu_operators_cpu_usage = 0.0
+        for i in gpu_operator_indices:
+            gpu_operators_cpu_usage += concurrency_list[i] * cpu_usage_list[i]
+
+        logger.debug(
+            f"GPU/NPU operators CPU usage: {gpu_operators_cpu_usage}, "
+            f"Total CPU: {N_cpu}"
+        )
+
+        # Step 3: Calculate remaining CPU for CPU-only operators
+        remaining_cpu = N_cpu - gpu_operators_cpu_usage
+        if remaining_cpu <= 0:
+            logger.warning(
+                f"No remaining CPU after GPU/NPU operators. "
+                f"GPU/NPU CPU usage: {gpu_operators_cpu_usage}, Total CPU: {N_cpu}"
+            )
+            return concurrency_list
+
+        # Step 4: Calculate current CPU usage by CPU-only operators
+        current_cpu_only_usage = 0.0
+        for i in cpu_only_operator_indices:
+            current_cpu_only_usage += concurrency_list[i] * cpu_usage_list[i]
+
+        if current_cpu_only_usage <= 0:
+            logger.debug("CPU-only operators have zero CPU usage. Skipping scaling.")
+            return concurrency_list
+
+        # Step 5: Calculate scaling factor
+        # We want to scale up proportionally so that total CPU-only usage = remaining_cpu
+        scaling_factor = remaining_cpu / current_cpu_only_usage
+
+        logger.debug(
+            f"CPU scaling: remaining_cpu={remaining_cpu}, "
+            f"current_cpu_only_usage={current_cpu_only_usage}, "
+            f"scaling_factor={scaling_factor}"
+        )
+
+        # Only scale up (factor > 1), don't scale down
+        if scaling_factor <= 1.0:
+            logger.debug(
+                f"Scaling factor {scaling_factor} <= 1.0. "
+                f"No need to scale up CPU-only operators."
+            )
+            return concurrency_list
+
+        # Step 6: Apply scaling to CPU-only operators
+        result = list(concurrency_list)
+        for i in cpu_only_operator_indices:
+            old_concurrency = result[i]
+            # Scale and round to nearest integer, ensure at least 1
+            new_concurrency = max(1, int(round(old_concurrency * scaling_factor)))
+            result[i] = new_concurrency
+
+            logger.debug(
+                f"CPU-only operator {i}: concurrency {old_concurrency} -> {new_concurrency} "
+                f"(factor={scaling_factor:.2f})"
+            )
+
+        logger.info(
+            f"Post-processing complete: original={list(concurrency_list)}, "
+            f"scaled={result}, scaling_factor={scaling_factor:.2f}"
+        )
+
+        return result
 
     def _scale_operator(self, op: ActorPoolMapOperator, target_concurrency: int):
         """Scale an operator's actor pool to match the target concurrency.
