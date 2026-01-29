@@ -44,47 +44,63 @@ def create_autoscaler(
             config=config,
         )
     elif autoscaler_type == "ds2":
-        from .ds2_autoscaler import DS2Autoscaler, SolverType
+        # from .ds2_autoscaler import DS2Autoscaler, SolverType
 
-        # Map string solver type to enum
-        solver_type_map = {
-            "BASIC": SolverType.BASIC,
-            "QUEUE_DIGESTION": SolverType.QUEUE_DIGESTION,
-            "RELATIVE_DEVIATION": SolverType.RELATIVE_DEVIATION,
-            "TIME_UNIFIED": SolverType.TIME_UNIFIED,
-        }
-        solver_type = solver_type_map.get(config.ds2_solver_type, SolverType.BASIC)
+        # # Map string solver type to enum
+        # solver_type_map = {
+        #     "BASIC": SolverType.BASIC,
+        #     "QUEUE_DIGESTION": SolverType.QUEUE_DIGESTION,
+        #     "RELATIVE_DEVIATION": SolverType.RELATIVE_DEVIATION,
+        #     "TIME_UNIFIED": SolverType.TIME_UNIFIED,
+        # }
+        # solver_type = solver_type_map.get(config.ds2_solver_type, SolverType.BASIC)
 
+        # return DS2Autoscaler(
+        #     topology,
+        #     resource_manager,
+        #     execution_id=execution_id,
+        #     solver_type=solver_type,
+        #     solver_weight=config.ds2_solver_weight,
+        #     time_horizon=config.ds2_time_horizon,
+        #     target_queue_sizes=config.ds2_target_queue_sizes,
+        # )
+        from .ds2_autoscaler import DS2Autoscaler
         return DS2Autoscaler(
             topology,
             resource_manager,
             execution_id=execution_id,
-            solver_type=solver_type,
-            solver_weight=config.ds2_solver_weight,
-            time_horizon=config.ds2_time_horizon,
-            target_queue_sizes=config.ds2_target_queue_sizes,
         )
     elif autoscaler_type == "real_ds2":
         from .real_ds2_autoscaler import RealDS2Autoscaler
 
+        # return RealDS2Autoscaler(
+        #     topology,
+        #     resource_manager,
+        #     execution_id=execution_id,
+        #     max_parallelism=config.max_parallelism,
+        #     use_incremental_output_rate=config.use_incremental_output_rate,
+        # )
         return RealDS2Autoscaler(
             topology,
             resource_manager,
             execution_id=execution_id,
-            max_parallelism=config.max_parallelism,
-            use_incremental_output_rate=config.use_incremental_output_rate,
         )
     elif autoscaler_type == "conttune":
         from .conttune_autoscaler import ContTuneAutoscaler
 
+        # return ContTuneAutoscaler(
+        #     topology,
+        #     resource_manager,
+        #     execution_id=execution_id,
+        #     alpha=config.conttune_alpha,
+        #     max_parallelism=config.max_parallelism,
+        #     k=config.conttune_k,
+        #     use_incremental_output_rate=config.use_incremental_output_rate,
+        # )
         return ContTuneAutoscaler(
             topology,
             resource_manager,
             execution_id=execution_id,
-            alpha=config.conttune_alpha,
-            max_parallelism=config.max_parallelism,
-            k=config.conttune_k,
-            use_incremental_output_rate=config.use_incremental_output_rate,
         )
     else:
         raise ValueError(
