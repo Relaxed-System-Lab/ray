@@ -204,11 +204,11 @@ class ActorPoolMapOperator(MapOperator):
 
     def start(self, options: ExecutionOptions):
         self._actor_locality_enabled = options.actor_locality_enabled
-        # [DEBUG] Log whether actor locality is enabled
-        logger.warning(
-            f"[LOCALITY_DEBUG] ActorPoolMapOperator '{self.name}' started with "
-            f"actor_locality_enabled={self._actor_locality_enabled}"
-        )
+#         # [DEBUG] Log whether actor locality is enabled
+#         logger.warning(
+#             f"[LOCALITY_DEBUG] ActorPoolMapOperator '{self.name}' started with "
+#             f"actor_locality_enabled={self._actor_locality_enabled}"
+#         )
         super().start(options)
 
         # Create the actor workers and add them to the pool.
@@ -609,13 +609,13 @@ class _ActorTaskSelectorImpl(_ActorTaskSelector):
             # or actors that are marked for removal.
             bundle = input_queue.peek()
 
-            # [DEBUG] Log bundle's preferred locations (where data resides)
-            bundle_locations = bundle.get_preferred_object_locations()
-            logger.warning(
-                f"[LOCALITY_DEBUG] Bundle has {len(bundle.blocks)} blocks, "
-                f"preferred_locations (node_id -> bytes): {bundle_locations}"
-            )
-
+#             # [DEBUG] Log bundle's preferred locations (where data resides)
+#             bundle_locations = bundle.get_preferred_object_locations()
+#             logger.warning(
+#                 f"[LOCALITY_DEBUG] Bundle has {len(bundle.blocks)} blocks, "
+#                 f"preferred_locations (node_id -> bytes): {bundle_locations}"
+#             )
+# 
             valid_actors = [
                 actor
                 for actor in self._actor_pool.running_actors()
@@ -624,30 +624,30 @@ class _ActorTaskSelectorImpl(_ActorTaskSelector):
                 and not self._actor_pool.running_actors()[actor].is_restarting
                 and not self._actor_pool.is_actor_marked_for_removal(actor)
             ]
-
-            # [DEBUG] Log which actors are filtered out due to being at capacity
-            filtered_out_actors = [
-                (self._actor_pool.running_actors()[actor].actor_location,
-                 self._actor_pool.running_actors()[actor].num_tasks_in_flight)
-                for actor in self._actor_pool.running_actors()
-                if actor not in valid_actors
-            ]
-            if filtered_out_actors:
-                logger.warning(
-                    f"[LOCALITY_DEBUG] Actors filtered out (at capacity): "
-                    f"{filtered_out_actors} "
-                    f"(max_tasks_in_flight={self._actor_pool.max_tasks_in_flight_per_actor()})"
-                )
-
-            # [DEBUG] Log valid actors and their locations
-            valid_actor_info = [
-                (self._actor_pool.running_actors()[actor].actor_location,
-                 self._actor_pool.running_actors()[actor].num_tasks_in_flight)
-                for actor in valid_actors
-            ]
-            logger.warning(
-                f"[LOCALITY_DEBUG] Valid actors (location, tasks_in_flight): {valid_actor_info}"
-            )
+# 
+#             # [DEBUG] Log which actors are filtered out due to being at capacity
+#             filtered_out_actors = [
+#                 (self._actor_pool.running_actors()[actor].actor_location,
+#                  self._actor_pool.running_actors()[actor].num_tasks_in_flight)
+#                 for actor in self._actor_pool.running_actors()
+#                 if actor not in valid_actors
+#             ]
+#             if filtered_out_actors:
+#                 logger.warning(
+#                     f"[LOCALITY_DEBUG] Actors filtered out (at capacity): "
+#                     f"{filtered_out_actors} "
+#                     f"(max_tasks_in_flight={self._actor_pool.max_tasks_in_flight_per_actor()})"
+#                 )
+# 
+#             # [DEBUG] Log valid actors and their locations
+#             valid_actor_info = [
+#                 (self._actor_pool.running_actors()[actor].actor_location,
+#                  self._actor_pool.running_actors()[actor].num_tasks_in_flight)
+#                 for actor in valid_actors
+#             ]
+#             logger.warning(
+#                 f"[LOCALITY_DEBUG] Valid actors (location, tasks_in_flight): {valid_actor_info}"
+#             )
 
             if not valid_actors:
                 # All actors are at capacity or actor state is not ALIVE.
@@ -667,18 +667,18 @@ class _ActorTaskSelectorImpl(_ActorTaskSelector):
 
             target_actor = valid_actors[target_actor_idx]
 
-            # [DEBUG] Log the final selection and whether it's a locality hit or miss
-            target_location = self._actor_pool.running_actors()[target_actor].actor_location
-            is_locality_hit = target_location in bundle_locations
-            hit_bytes = bundle_locations.get(target_location, 0)
-            total_bytes = sum(bundle_locations.values())
-            locality_hit_percent = (hit_bytes / total_bytes * 100) if total_bytes > 0 else 0
-            logger.warning(
-                f"[LOCALITY_DEBUG] Selected actor at {target_location}, "
-                f"locality_hit={is_locality_hit}, "
-                f"locality_hit_percent={locality_hit_percent:.2f}%, "
-                f"rank={ranks[target_actor_idx]}"
-            )
+#             # [DEBUG] Log the final selection and whether it's a locality hit or miss
+#             target_location = self._actor_pool.running_actors()[target_actor].actor_location
+#             is_locality_hit = target_location in bundle_locations
+#             hit_bytes = bundle_locations.get(target_location, 0)
+#             total_bytes = sum(bundle_locations.values())
+#             locality_hit_percent = (hit_bytes / total_bytes * 100) if total_bytes > 0 else 0
+#             logger.warning(
+#                 f"[LOCALITY_DEBUG] Selected actor at {target_location}, "
+#                 f"locality_hit={is_locality_hit}, "
+#                 f"locality_hit_percent={locality_hit_percent:.2f}%, "
+#                 f"rank={ranks[target_actor_idx]}"
+#             )
 
             # We remove the bundle and yield the actor to the operator. We do not use pop()
             # in case the queue has changed the order of the bundles.

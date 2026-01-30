@@ -689,29 +689,29 @@ def _merge_ref_bundles(*bundles: RefBundle) -> RefBundle:
     """Merge N ref bundles into a single bundle of multiple blocks."""
     # Check that at least one bundle is non-null.
     assert any(bundle is not None for bundle in bundles)
-
-    # [DEBUG] Log bundle merging and locality information
-    logger = logging.getLogger(__name__)
-    if len(bundles) > 1:
-        all_locations = []
-        for i, bundle in enumerate(bundles):
-            if bundle is not None:
-                locs = bundle.get_preferred_object_locations()
-                all_locations.append(locs)
-        # Check if blocks are from different nodes
-        all_nodes = set()
-        for locs in all_locations:
-            all_nodes.update(locs.keys())
-        if len(all_nodes) > 1:
-            logger.warning(
-                f"[LOCALITY_DEBUG] Merging {len(bundles)} bundles from DIFFERENT nodes! "
-                f"Nodes involved: {all_nodes}, "
-                f"per-bundle locations: {all_locations}"
-            )
-        else:
-            logger.warning(
-                f"[LOCALITY_DEBUG] Merging {len(bundles)} bundles from SAME node(s): {all_nodes}"
-            )
+# 
+#     # [DEBUG] Log bundle merging and locality information
+#     logger = logging.getLogger(__name__)
+#     if len(bundles) > 1:
+#         all_locations = []
+#         for i, bundle in enumerate(bundles):
+#             if bundle is not None:
+#                 locs = bundle.get_preferred_object_locations()
+#                 all_locations.append(locs)
+#         # Check if blocks are from different nodes
+#         all_nodes = set()
+#         for locs in all_locations:
+#             all_nodes.update(locs.keys())
+#         if len(all_nodes) > 1:
+#             logger.warning(
+#                 f"[LOCALITY_DEBUG] Merging {len(bundles)} bundles from DIFFERENT nodes! "
+#                 f"Nodes involved: {all_nodes}, "
+#                 f"per-bundle locations: {all_locations}"
+#             )
+#         else:
+#             logger.warning(
+#                 f"[LOCALITY_DEBUG] Merging {len(bundles)} bundles from SAME node(s): {all_nodes}"
+#             )
 
     blocks = list(
         itertools.chain(

@@ -110,8 +110,8 @@ class DS2Autoscaler(Autoscaler):
         # Use total cumulative values (without updating EMA) to avoid polluting EMA during cold start
         wall_time_list = self.get_wall_time()
         processed_rows_list = self.get_num_processed_rows()
-        logger.debug(f"Total wall time list: {wall_time_list}")
-        logger.debug(f"Total processed rows list: {processed_rows_list}")
+        logger.info(f"Total wall time list: {wall_time_list}")
+        logger.info(f"Total processed rows list: {processed_rows_list}")
 
         n = len(wall_time_list)
         if n == 0:
@@ -131,14 +131,28 @@ class DS2Autoscaler(Autoscaler):
         # All operators are working, now collect EMA-smoothed metrics
         # This updates the EMA values and last snapshots
         ema_wall_time_list = self.get_ema_wall_time()
-        logger.debug(f"EMA wall time list: {ema_wall_time_list}")
+        logger.info(f"EMA wall time list: {ema_wall_time_list}")
         ema_num_processed_rows_list = self.get_ema_num_processed_rows()
-        logger.debug(f"EMA num processed rows list: {ema_num_processed_rows_list}")
+        logger.info(f"EMA num processed rows list: {ema_num_processed_rows_list}")
+
+        # Adjust ema_wall_time for operators with "Preprocess" in their name
+        op_index = 0
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
+                if "Preprocess" in op.name:
+                    original_ema_wall_time = ema_wall_time_list[op_index]
+                    ema_wall_time_list[op_index] = original_ema_wall_time * 2
+                    logger.info(
+                        f"Operator {op.name} contains 'Preprocess', "
+                        f"multiplying ema_wall_time by 2: {original_ema_wall_time} -> {ema_wall_time_list[op_index]}"
+                    )
+                op_index += 1
+        logger.info(f"processed EMA wall time list: {ema_wall_time_list}")
 
         per_actor_resource_usage_list = self.get_per_actor_resource_usage()
-        logger.debug(f"Per actor resource usage list: {per_actor_resource_usage_list}")
+        logger.info(f"Per actor resource usage list: {per_actor_resource_usage_list}")
         total_resources = self.get_total_resources()
-        logger.debug(f"Total resources: {total_resources}")
+        logger.info(f"Total resources: {total_resources}")
 
         # Calculate unit throughput for each operator using EMA values
         unit_throughput_list = []
@@ -274,9 +288,13 @@ class DS2Autoscaler(Autoscaler):
             List of target concurrency for each operator, or None if solver failed.
         """
         D_i = [float(x) for x in ema_num_processed_rows_list]
+        logger.info(f"n={n}, ut={unit_throughput_list}, cpu_usage={cpu_usage_list},"
+                    f"gpu_usage={gpu_usage_list},"
+                    f"D_i={D_i}, D_o={D_o}, N_cpu={N_cpu}, N_gpu={N_gpu}")
 
         if self._solver_type == SolverType.BASIC:
             # Original solver without queue size consideration
+            
             return milp_solver(
                 n, unit_throughput_list, cpu_usage_list, gpu_usage_list,
                 ema_num_processed_rows_list, D_o, N_cpu, N_gpu,
@@ -634,9 +652,9 @@ class DS2Autoscaler(Autoscaler):
                 # When max_concurrency > 1, wall_time is accumulated from
                 # concurrent tasks, so we divide by max_concurrency to get
                 # the actual processing time per task.
-                max_concurrency = op._actor_pool._max_actor_concurrency
-                if max_concurrency > 0:
-                    time_delta = time_delta / max_concurrency
+                # max_concurrency = op._actor_pool._max_actor_concurrency
+                # if max_concurrency > 0:
+                #     time_delta = time_delta / max_concurrency
 
                 # Apply EMA smoothing
                 if op._metrics.ema_wall_time == 0.0:
