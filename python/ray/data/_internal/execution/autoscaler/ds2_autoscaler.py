@@ -167,6 +167,21 @@ class DS2Autoscaler(Autoscaler):
         delta_num_processed_rows_list = self.get_delta_num_processed_rows()
         logger.info(f"Delta num processed rows list: {delta_num_processed_rows_list}")
 
+        # Ensure operators have made progress since the last snapshot.
+        if not all(
+            wall_time > 0 and processed_rows > 0
+            for wall_time, processed_rows in zip(
+                delta_wall_time_list, delta_num_processed_rows_list
+            )
+        ):
+            logger.debug(
+                "Skipping DS2 autoscaling: not all operators have positive "
+                "delta wall time and processed rows since last snapshot. "
+                f"Delta wall time: {delta_wall_time_list}, "
+                f"Delta processed rows: {delta_num_processed_rows_list}"
+            )
+            return
+
         # Adjust delta_wall_time for operators with "Preprocess" in their name
         op_index = 0
         for op, op_state in self._topology.items():
