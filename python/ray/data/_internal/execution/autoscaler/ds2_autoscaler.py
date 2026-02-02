@@ -39,6 +39,10 @@ class DS2Autoscaler(Autoscaler):
     # Min number of seconds between two autoscaling requests.
     MIN_GAP_BETWEEN_AUTOSCALING_REQUESTS = 60
 
+    # Gap time (seconds) after all operators are initialized before starting autoscaling.
+    # This allows the system to stabilize after initialization.
+    INITIALIZATION_GAP_TIME = 60.0
+
     # EMA smoothing factor (alpha) for throughput calculation.
     # Higher values (closer to 1.0) give more weight to recent observations.
     # Lower values (closer to 0.0) give more weight to historical data.
@@ -69,6 +73,10 @@ class DS2Autoscaler(Autoscaler):
         self._time_horizon = time_horizon or self.DEFAULT_TIME_HORIZON
         self._target_queue_sizes = target_queue_sizes
 
+        # Initialization tracking
+        self._all_operators_initialized = False
+        self._initialization_complete_time: Optional[float] = None
+
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
         self.ds2_scaling()
@@ -92,13 +100,60 @@ class DS2Autoscaler(Autoscaler):
         """Perform DS2 autoscaling based on MILP solver results.
 
         This method:
-        1. Checks if enough time has passed since last scaling
-        2. Collects metrics from all ActorPoolMapOperators
-        3. Calls MILP solver to get optimal concurrency for each operator
-        4. Scales each operator's actor pool to match the target concurrency
+        1. Checks if all operators have been initialized
+        2. Waits for INITIALIZATION_GAP_TIME after initialization completes
+        3. Checks if enough time has passed since last scaling
+        4. Collects metrics from all ActorPoolMapOperators
+        5. Calls MILP solver to get optimal concurrency for each operator
+        6. Scales each operator's actor pool to match the target concurrency
         """
-        # Check frequency limit
         now = time.time()
+
+        # Step 1: Check if all operators have been initialized
+        if not self._all_operators_initialized:
+            wall_time_list = self.get_wall_time()
+            processed_rows_list = self.get_num_processed_rows()
+
+            n = len(wall_time_list)
+            if n == 0:
+                logger.debug("No ActorPoolMapOperators found. Skipping DS2 autoscaling.")
+                return
+
+            # Check if all operators have processed data (initialization complete)
+            all_initialized = all(wall_time > 0 and processed_rows > 0
+                                 for wall_time, processed_rows in zip(wall_time_list, processed_rows_list))
+
+            if not all_initialized:
+                logger.debug(
+                    "Not all operators have been initialized yet. "
+                    f"Wall time: {wall_time_list}, Processed rows: {processed_rows_list}"
+                )
+                return
+
+            # All operators are now initialized
+            self._all_operators_initialized = True
+            self._initialization_complete_time = now
+
+            # Initialize baseline metrics for all operators
+            self._initialize_baseline_metrics()
+
+            logger.info(
+                f"All operators initialized at {now}. "
+                f"Will start autoscaling after {self.INITIALIZATION_GAP_TIME}s gap time."
+            )
+            return
+
+        # Step 2: Wait for gap time after initialization
+        assert self._initialization_complete_time is not None
+        time_since_init = now - self._initialization_complete_time
+        if time_since_init < self.INITIALIZATION_GAP_TIME:
+            logger.debug(
+                f"Skipping DS2 autoscaling: only {time_since_init:.1f}s since initialization "
+                f"(gap time: {self.INITIALIZATION_GAP_TIME}s)"
+            )
+            return
+
+        # Step 3: Check frequency limit
         if now - self._last_scaling_time < self.MIN_GAP_BETWEEN_AUTOSCALING_REQUESTS:
             logger.debug(
                 f"Skipping DS2 autoscaling: only {now - self._last_scaling_time:.1f}s "
@@ -106,67 +161,44 @@ class DS2Autoscaler(Autoscaler):
             )
             return
 
-        # First, check if all operators have started processing
-        # Use total cumulative values (without updating EMA) to avoid polluting EMA during cold start
-        wall_time_list = self.get_wall_time()
-        processed_rows_list = self.get_num_processed_rows()
-        logger.info(f"Total wall time list: {wall_time_list}")
-        logger.info(f"Total processed rows list: {processed_rows_list}")
+        # Step 4: Collect incremental metrics (delta since last snapshot)
+        delta_wall_time_list = self.get_delta_wall_time()
+        logger.info(f"Delta wall time list: {delta_wall_time_list}")
+        delta_num_processed_rows_list = self.get_delta_num_processed_rows()
+        logger.info(f"Delta num processed rows list: {delta_num_processed_rows_list}")
 
-        n = len(wall_time_list)
-        if n == 0:
-            logger.debug("No ActorPoolMapOperators found. Skipping DS2 autoscaling.")
-            return
-
-        # Check if all operators have processed data
-        all_work = all(wall_time > 0 and processed_rows > 0
-                       for wall_time, processed_rows in zip(wall_time_list, processed_rows_list))
-
-        if not all_work:
-            logger.debug(
-                "Not all operators have processed data yet. Skipping DS2 autoscaling."
-            )
-            return
-
-        # All operators are working, now collect EMA-smoothed metrics
-        # This updates the EMA values and last snapshots
-        ema_wall_time_list = self.get_ema_wall_time()
-        logger.info(f"EMA wall time list: {ema_wall_time_list}")
-        ema_num_processed_rows_list = self.get_ema_num_processed_rows()
-        logger.info(f"EMA num processed rows list: {ema_num_processed_rows_list}")
-
-        # Adjust ema_wall_time for operators with "Preprocess" in their name
+        # Adjust delta_wall_time for operators with "Preprocess" in their name
         op_index = 0
         for op, op_state in self._topology.items():
             if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 if "Preprocess" in op.name:
-                    original_ema_wall_time = ema_wall_time_list[op_index]
-                    ema_wall_time_list[op_index] = original_ema_wall_time * 2
+                    original_delta_wall_time = delta_wall_time_list[op_index]
+                    delta_wall_time_list[op_index] = original_delta_wall_time * 2
                     logger.info(
                         f"Operator {op.name} contains 'Preprocess', "
-                        f"multiplying ema_wall_time by 2: {original_ema_wall_time} -> {ema_wall_time_list[op_index]}"
+                        f"multiplying delta_wall_time by 2: {original_delta_wall_time} -> {delta_wall_time_list[op_index]}"
                     )
                 op_index += 1
-        logger.info(f"processed EMA wall time list: {ema_wall_time_list}")
+        logger.info(f"Processed delta wall time list: {delta_wall_time_list}")
 
         per_actor_resource_usage_list = self.get_per_actor_resource_usage()
         logger.info(f"Per actor resource usage list: {per_actor_resource_usage_list}")
         total_resources = self.get_total_resources()
         logger.info(f"Total resources: {total_resources}")
 
-        # Calculate unit throughput for each operator using EMA values
+        # Calculate unit throughput for each operator using delta values
         unit_throughput_list = []
-        for wall_time, num_rows in zip(ema_wall_time_list, ema_num_processed_rows_list):
+        for wall_time, num_rows in zip(delta_wall_time_list, delta_num_processed_rows_list):
             if wall_time > 0:
                 unit_throughput_list.append(num_rows / wall_time)
             else:
-                # This should not happen since we already checked all_work
-                # But keep it for safety
+                # If wall_time is 0, the operator hasn't processed anything in this window
+                # Use a very small throughput to avoid division by zero
                 logger.warning(
-                    f"EMA wall time is 0 for an operator. This should not happen. "
-                    f"Skipping DS2 autoscaling."
+                    f"Delta wall time is 0 for an operator (delta_rows={num_rows}). "
+                    f"Using fallback throughput of 0.001 rows/s."
                 )
-                raise ValueError("EMA wall time is 0 for an operator")
+                unit_throughput_list.append(0.001)
 
         # Extract CPU and GPU usage
         cpu_usage_list = []
@@ -192,14 +224,16 @@ class DS2Autoscaler(Autoscaler):
         N_cpu = total_resources._cpu or 0.0
         N_gpu = total_resources._gpu or 0.0
 
+        n = len(delta_wall_time_list)
+
         # Call appropriate MILP solver based on solver_type
         concurrency_list = self._call_solver(
             n=n,
             unit_throughput_list=unit_throughput_list,
             cpu_usage_list=cpu_usage_list,
             gpu_usage_list=gpu_usage_list,
-            ema_num_processed_rows_list=ema_num_processed_rows_list,
-            ema_wall_time_list=ema_wall_time_list,
+            delta_num_processed_rows_list=delta_num_processed_rows_list,
+            delta_wall_time_list=delta_wall_time_list,
             D_o=D_o,
             N_cpu=N_cpu,
             N_gpu=N_gpu,
@@ -252,6 +286,16 @@ class DS2Autoscaler(Autoscaler):
                         f"multiplying concurrency by 4: {concurrency_list[op_index]} -> {target_concurrency}"
                     )
 
+                # If operator name contains "VideoCaptionVLLM", ensure concurrency >= 6
+                if "VideoCaptionVLLM" in op.name:
+                    if target_concurrency < 6:
+                        original_concurrency = target_concurrency
+                        target_concurrency = 6
+                        logger.info(
+                            f"Operator {op.name} contains 'VideoCaptionVLLM', "
+                            f"enforcing minimum concurrency of 6: {original_concurrency} -> {target_concurrency}"
+                        )
+
                 self._scale_operator(op, target_concurrency)
 
                 op_index += 1
@@ -265,8 +309,8 @@ class DS2Autoscaler(Autoscaler):
         unit_throughput_list: List[float],
         cpu_usage_list: List[float],
         gpu_usage_list: List[float],
-        ema_num_processed_rows_list: List[float],
-        ema_wall_time_list: List[float],
+        delta_num_processed_rows_list: List[float],
+        delta_wall_time_list: List[float],
         D_o: float,
         N_cpu: float,
         N_gpu: float,
@@ -278,8 +322,8 @@ class DS2Autoscaler(Autoscaler):
             unit_throughput_list: Unit throughput for each operator
             cpu_usage_list: CPU usage per actor for each operator
             gpu_usage_list: GPU usage per actor for each operator
-            ema_num_processed_rows_list: EMA processed rows (D_i) for each operator
-            ema_wall_time_list: EMA wall time for each operator (for weight calculation)
+            delta_num_processed_rows_list: Delta processed rows (D_i) for each operator
+            delta_wall_time_list: Delta wall time for each operator (for weight calculation)
             D_o: Total output rows generated
             N_cpu: Total available CPU
             N_gpu: Total available GPU
@@ -287,17 +331,17 @@ class DS2Autoscaler(Autoscaler):
         Returns:
             List of target concurrency for each operator, or None if solver failed.
         """
-        D_i = [float(x) for x in ema_num_processed_rows_list]
+        D_i = [float(x) for x in delta_num_processed_rows_list]
         logger.info(f"n={n}, ut={unit_throughput_list}, cpu_usage={cpu_usage_list},"
                     f"gpu_usage={gpu_usage_list},"
                     f"D_i={D_i}, D_o={D_o}, N_cpu={N_cpu}, N_gpu={N_gpu}")
 
         if self._solver_type == SolverType.BASIC:
             # Original solver without queue size consideration
-            
+
             return milp_solver(
                 n, unit_throughput_list, cpu_usage_list, gpu_usage_list,
-                ema_num_processed_rows_list, D_o, N_cpu, N_gpu,
+                delta_num_processed_rows_list, D_o, N_cpu, N_gpu,
             )
 
         elif self._solver_type == SolverType.QUEUE_DIGESTION:
@@ -354,7 +398,7 @@ class DS2Autoscaler(Autoscaler):
                 B_target=B_target,
                 T=self._time_horizon,
                 alpha=self._solver_weight,
-                ema_wall_time=ema_wall_time_list,
+                ema_wall_time=delta_wall_time_list,
             )
 
         elif self._solver_type == SolverType.TIME_UNIFIED:
@@ -594,6 +638,18 @@ class DS2Autoscaler(Autoscaler):
             op._inputs_complete and op_state.total_enqueued_input_bundles() == 0
         )
 
+    def _initialize_baseline_metrics(self):
+        """Initialize baseline metrics for all operators after initialization completes.
+
+        This sets the last_block_generation_time and last_rows_task_inputs_processed
+        to the current values, so that subsequent delta calculations start from this point.
+        """
+        for op, op_state in self._topology.items():
+            if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
+                op._metrics.last_block_generation_time = op._metrics.block_generation_time
+                op._metrics.last_rows_task_inputs_processed = op._metrics.rows_task_inputs_processed
+        logger.info("Baseline metrics initialized for all operators.")
+
     def get_wall_time(self) -> List[float]:
         """Get total cumulative wall time for each operator.
 
@@ -626,20 +682,16 @@ class DS2Autoscaler(Autoscaler):
                 num_processed_rows_list.append(op._metrics.rows_task_inputs_processed)
         return num_processed_rows_list
 
-    def get_ema_wall_time(self) -> List[float]:
-        """Get EMA-smoothed wall time for each operator and update metrics.
+    def get_delta_wall_time(self) -> List[float]:
+        """Get delta wall time for each operator since last call and update baseline.
 
-        Computes the exponential moving average (EMA) of wall time deltas
-        to smooth out short-term fluctuations and provide a more stable
-        estimate of operator throughput.
-
-        This method should only be called after all operators have started
-        processing (i.e., after all_work check passes).
+        Computes the wall time delta since the last snapshot and updates the snapshot.
+        This should only be called after all operators have been initialized.
 
         Returns:
-            List of EMA-smoothed wall time values for each ActorPoolMapOperator.
+            List of delta wall time values for each ActorPoolMapOperator.
         """
-        wall_time_list = []
+        delta_wall_time_list = []
         for op, op_state in self._topology.items():
             if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 current_time = op._metrics.block_generation_time
@@ -648,47 +700,23 @@ class DS2Autoscaler(Autoscaler):
                 # Calculate the time delta since last call
                 time_delta = current_time - last_time
 
-                # Adjust for max_concurrency overlap:
-                # When max_concurrency > 1, wall_time is accumulated from
-                # concurrent tasks, so we divide by max_concurrency to get
-                # the actual processing time per task.
-                # max_concurrency = op._actor_pool._max_actor_concurrency
-                # if max_concurrency > 0:
-                #     time_delta = time_delta / max_concurrency
-
-                # Apply EMA smoothing
-                if op._metrics.ema_wall_time == 0.0:
-                    # First time: initialize EMA with current delta
-                    ema_time = time_delta
-                else:
-                    # EMA formula: EMA_new = α * current + (1 - α) * EMA_old
-                    ema_time = (
-                        self.EMA_ALPHA * time_delta +
-                        (1 - self.EMA_ALPHA) * op._metrics.ema_wall_time
-                    )
-
-                # Update metrics
-                op._metrics.ema_wall_time = ema_time
+                # Update the snapshot for next call
                 op._metrics.last_block_generation_time = current_time
 
-                wall_time_list.append(ema_time)
+                delta_wall_time_list.append(time_delta)
 
-        return wall_time_list
+        return delta_wall_time_list
 
-    def get_ema_num_processed_rows(self) -> List[float]:
-        """Get EMA-smoothed number of processed rows for each operator and update metrics.
+    def get_delta_num_processed_rows(self) -> List[float]:
+        """Get delta processed rows for each operator since last call and update baseline.
 
-        Computes the exponential moving average (EMA) of processed rows deltas
-        to smooth out short-term fluctuations and provide a more stable
-        estimate of operator throughput.
-
-        This method should only be called after all operators have started
-        processing (i.e., after all_work check passes).
+        Computes the processed rows delta since the last snapshot and updates the snapshot.
+        This should only be called after all operators have been initialized.
 
         Returns:
-            List of EMA-smoothed processed row counts for each ActorPoolMapOperator.
+            List of delta processed row counts for each ActorPoolMapOperator.
         """
-        num_processed_rows_list = []
+        delta_num_processed_rows_list = []
         for op, op_state in self._topology.items():
             if isinstance(op, ActorPoolMapOperator) and not self._is_op_completed(op, op_state):
                 current_rows = op._metrics.rows_task_inputs_processed
@@ -697,25 +725,14 @@ class DS2Autoscaler(Autoscaler):
                 # Calculate the rows delta since last call
                 rows_delta = current_rows - last_rows
 
-                # Apply EMA smoothing
-                if op._metrics.ema_processed_rows == 0.0:
-                    # First time: initialize EMA with current delta
-                    ema_rows = float(rows_delta)
-                else:
-                    # EMA formula: EMA_new = α * current + (1 - α) * EMA_old
-                    ema_rows = (
-                        self.EMA_ALPHA * rows_delta +
-                        (1 - self.EMA_ALPHA) * op._metrics.ema_processed_rows
-                    )
-
-                # Update metrics
-                op._metrics.ema_processed_rows = ema_rows
+                # Update the snapshot for next call
                 op._metrics.last_rows_task_inputs_processed = current_rows
 
-                # Return as integer (rounded)
-                num_processed_rows_list.append(ema_rows)
+                delta_num_processed_rows_list.append(float(rows_delta))
 
-        return num_processed_rows_list
+        return delta_num_processed_rows_list
+
+
 
     def get_per_actor_resource_usage(self) -> List[ExecutionResources]:
         per_actor_resource_usage_list = []
