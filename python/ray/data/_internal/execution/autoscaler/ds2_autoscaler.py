@@ -255,8 +255,10 @@ class DS2Autoscaler(Autoscaler):
         )
 
         if concurrency_list is None:
-            logger.warning("MILP solver returned None. Skipping DS2 autoscaling.")
-            raise ValueError("MILP solver returned None.")
+            logger.warning(
+                "MILP solver returned None. Skipping DS2 autoscaling and keeping current concurrency."
+            )
+            return
 
         RESERVE_CPU_FRACTION = 0.05
         # Post-processing: scale up CPU-only operators to maximize CPU utilization
