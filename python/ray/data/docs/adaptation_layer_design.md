@@ -82,17 +82,17 @@ DS2 Autoscaler
 - 使用欧氏距离在特征空间匹配或新建 cluster。
 - 关键参数：
   - max_clusters=6
-  - distance_threshold=0.6
-  - decay_gamma=0.98
-  - decay_interval_s=60
+  - distance_threshold=1.2
+  - decay_gamma=0.995
+  - decay_interval_s=300
   - centroid_drift_threshold=0.4
 
 ### 调优触发
 - 触发条件：
-  - cluster.count >= min_samples (默认 20)
+  - cluster.count >= min_samples (默认 5)
   - cluster 占比 >= min_cluster_fraction (默认 0.1)
   - 未处于 tuning 或 tuning 冷却期
-- tuned 后记录 config 与最后 tuned centroid。
+  - tuned 后记录 config 与最后 tuned centroid。
 
 ### 调优器（BO）
 - 优先使用 sklearn GP (Matern kernel) 进行 EI 采样。
@@ -119,7 +119,7 @@ DS2 Autoscaler
 - `vLLM adaptation applied`：配置切换成功
 
 ## 可配置项（常用）
-- `min_samples`：触发 tuning 的样本阈值（默认 20）。
+- `min_samples`：触发 tuning 的样本阈值（默认 5）。
 - `decay_interval_s / decay_gamma`：样本衰减周期与系数。
 - `distance_threshold`：新建 cluster 的距离阈值。
 - `cooldown_s / tuning_cooldown_s`：切换与调优冷却时间。
@@ -137,6 +137,7 @@ DS2 Autoscaler
 
 ## 当前采用的配置（本次实验）
 - min_samples=5
+- distance_threshold=1.2
 - decay_interval_s=300
 - decay_gamma=0.995
 - prune_threshold=0.1

@@ -568,7 +568,7 @@ class VLLMAdaptationLayer:
         self,
         *,
         max_clusters: int = 6,
-        distance_threshold: float = 0.6,
+        distance_threshold: float = 1.2,
         min_samples: int = 5,
         min_cluster_fraction: float = 0.1,
         centroid_drift_threshold: float = 0.4,
