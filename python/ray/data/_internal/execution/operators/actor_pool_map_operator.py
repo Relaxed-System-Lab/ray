@@ -506,6 +506,52 @@ class ActorPoolMapOperator(MapOperator):
         """Returns Actor counts for Alive, Restarting and Pending Actors."""
         return self._actor_pool.get_actor_info()
 
+    def apply_adaptive_config(self, config: Dict[str, Any]) -> bool:
+        if not config:
+            return False
+        if not self._is_vllm_op:
+            logger.info(
+                "Adaptive config ignored for non-vLLM operator %s.",
+                self.name,
+            )
+            return False
+        map_transformer = getattr(self, "_map_transformer", None)
+        constructor_kwargs = getattr(map_transformer, "_udf_constructor_kwargs", None)
+        if not isinstance(constructor_kwargs, dict):
+            logger.info(
+                "Adaptive config ready for %s but no constructor kwargs found.",
+                self.name,
+            )
+            return False
+
+        num_removed, num_marked = self._actor_pool.my_scale_down(1, forced=False)
+        if num_removed <= 0:
+            logger.info(
+                "Adaptive config prepared for %s but no idle actor removed (marked=%s).",
+                self.name,
+                num_marked,
+            )
+            return False
+
+        engine_kwargs = constructor_kwargs.get("engine_kwargs")
+        if engine_kwargs is None or not isinstance(engine_kwargs, dict):
+            engine_kwargs = {}
+            constructor_kwargs["engine_kwargs"] = engine_kwargs
+        engine_kwargs.update(config)
+
+        self._actor_pool.scale(
+            ActorPoolScalingRequest.upscale(
+                delta=1,
+                reason="vLLM adaptive config update",
+            )
+        )
+        logger.info(
+            "Adaptive config applied for %s (one actor updated): %s",
+            self.name,
+            config,
+        )
+        return True
+
     def get_per_actor_resource_usage(self) -> ExecutionResources:
         return self._actor_pool._per_actor_resource_usage
 

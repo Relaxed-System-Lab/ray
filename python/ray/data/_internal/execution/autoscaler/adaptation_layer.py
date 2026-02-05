@@ -1,3 +1,4 @@
+import copy
 import logging
 import math
 import random
@@ -71,6 +72,11 @@ class ClusterStatus(Enum):
     TUNED = "tuned"
 
 
+class ConfigApplyScope(Enum):
+    PROBE = "probe"
+    ROLLOUT = "rollout"
+
+
 @dataclass
 class WorkloadCluster:
     cluster_id: int
@@ -78,6 +84,9 @@ class WorkloadCluster:
     count: float = 0.0
     status: ClusterStatus = ClusterStatus.PENDING
     config: Optional[Dict[str, Any]] = None
+    pending_config: Optional[Dict[str, Any]] = None
+    pending_observation_count: int = -1
+    needs_rollout: bool = False
     last_tuned_centroid: Optional[List[float]] = None
     last_tuned_time: Optional[float] = None
     last_updated_time: Optional[float] = None
@@ -89,6 +98,15 @@ class SwitchDecision:
     cluster_id: int
     config: Dict[str, Any]
     reason: str
+    scope: ConfigApplyScope
+
+
+@dataclass
+class RolloutState:
+    cluster_id: int
+    config: Dict[str, Any]
+    remaining: int
+    last_update_time: float = 0.0
 
 
 class VLLMConfigOptimizer:
@@ -113,11 +131,19 @@ class VLLMConfigOptimizer:
         self._y: List[float] = []
         self._gp: Optional[Any] = None
         self._feature_dim: Optional[int] = None
+        self._best_config: Optional[Dict[str, Any]] = None
+        self._best_objective: Optional[float] = None
+        self._observed: set = set()
 
     def observe(self, config: Dict[str, Any], objective: float) -> None:
-        vec = self._vectorize(config)
+        normalized = self.normalize_config(config)
+        vec = self._vectorize(normalized)
         self._X.append(vec)
         self._y.append(objective)
+        self._observed.add(tuple(vec))
+        if self._best_objective is None or objective > self._best_objective:
+            self._best_objective = objective
+            self._best_config = copy.deepcopy(normalized)
 
     def suggest(self) -> Dict[str, Any]:
         if len(self._X) < self._min_random or not _SKLEARN_AVAILABLE or np is None:
@@ -132,7 +158,10 @@ class VLLMConfigOptimizer:
         best_ei = -float("inf")
         for _ in range(self._candidates):
             candidate = self._sample_random()
-            vec = np.array([self._vectorize(candidate)], dtype=float)
+            vec_list = self._vectorize(candidate)
+            if tuple(vec_list) in self._observed:
+                continue
+            vec = np.array([vec_list], dtype=float)
             try:
                 mean, std = self._gp.predict(vec, return_std=True)
             except Exception:
@@ -144,6 +173,50 @@ class VLLMConfigOptimizer:
                 best_ei = ei
                 best_candidate = candidate
         return best_candidate or self._sample_random()
+
+    @property
+    def best_config(self) -> Optional[Dict[str, Any]]:
+        if self._best_config is None:
+            return None
+        return copy.deepcopy(self._best_config)
+
+    @property
+    def num_observations(self) -> int:
+        return len(self._y)
+
+    def reset(self) -> None:
+        self._X.clear()
+        self._y.clear()
+        self._gp = None
+        self._feature_dim = None
+        self._best_config = None
+        self._best_objective = None
+        self._observed.clear()
+
+    def normalize_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        normalized: Dict[str, Any] = {}
+        for spec in self._space:
+            name = spec["name"]
+            if name in config:
+                normalized[name] = config[name]
+            else:
+                normalized[name] = self._default_for_spec(spec)
+        return normalized
+
+    def _default_for_spec(self, spec: Dict[str, Any]) -> Any:
+        if "default" in spec:
+            return spec["default"]
+        typ = spec["type"]
+        if typ == "int":
+            return int(spec["lb"])
+        if typ == "float":
+            return float(spec["lb"])
+        if typ == "bool":
+            return False
+        if typ == "cat":
+            categories = list(spec.get("categories") or [])
+            return categories[0] if categories else None
+        return None
 
     def _fit_gp(self) -> None:
         if not _SKLEARN_AVAILABLE or np is None:
@@ -231,11 +304,9 @@ class VLLMConfigOptimizer:
             {"name": "max_num_seqs", "type": "int", "lb": 4, "ub": 64},
             {"name": "max_num_batched_tokens", "type": "int", "lb": 1024, "ub": 32768},
             {"name": "block_size", "type": "int", "lb": 8, "ub": 64},
-            {"name": "scheduler_delay_factor", "type": "float", "lb": 0.0, "ub": 1.0},
             {"name": "enable_chunked_prefill", "type": "bool"},
             {"name": "enable_prefix_caching", "type": "bool"},
             {"name": "disable_custom_all_reduce", "type": "bool"},
-            {"name": "use_v2_block_manager", "type": "bool"},
         ]
 
 
@@ -578,6 +649,8 @@ class VLLMAdaptationLayer:
         switch_consistency: float = 0.7,
         cooldown_s: float = 60.0,
         tuning_cooldown_s: float = 60.0,
+        bo_steps_required: int = 5,
+        rollout_interval_s: float = 30.0,
         prune_threshold: float = 0.1,
         cluster_log_interval_s: float = 60.0,
         feature_extractor: Optional[VLLMWorkloadFeatureExtractor] = None,
@@ -593,6 +666,8 @@ class VLLMAdaptationLayer:
         self._switch_consistency = switch_consistency
         self._cooldown_s = cooldown_s
         self._tuning_cooldown_s = tuning_cooldown_s
+        self._bo_steps_required = bo_steps_required
+        self._rollout_interval_s = rollout_interval_s
         self._prune_threshold = prune_threshold
         self._cluster_log_interval_s = cluster_log_interval_s
         self._feature_extractor = feature_extractor or VLLMWorkloadFeatureExtractor()
@@ -606,8 +681,11 @@ class VLLMAdaptationLayer:
         self._last_decay_time: Dict[Any, float] = defaultdict(lambda: 0.0)
         self._last_tune_time: Dict[Any, float] = defaultdict(lambda: 0.0)
         self._last_cluster_log_time: Dict[Any, float] = defaultdict(lambda: 0.0)
+        self._observation_count: Dict[Any, int] = defaultdict(int)
+        self._rollout_state: Dict[Any, Optional[RolloutState]] = defaultdict(
+            lambda: None
+        )
         self._next_cluster_id: Dict[Any, int] = defaultdict(int)
-        self._tuning_threads: Dict[Tuple[Any, int], threading.Thread] = {}
         self._lock = threading.Lock()
 
     def reset(self, op: Any) -> None:
@@ -619,6 +697,8 @@ class VLLMAdaptationLayer:
             self._last_decay_time.pop(op, None)
             self._last_tune_time.pop(op, None)
             self._next_cluster_id.pop(op, None)
+            self._observation_count.pop(op, None)
+            self._rollout_state.pop(op, None)
         self._feature_extractor.reset(op)
 
     def extract_features(self, op: Any, op_state: Any) -> Optional[WorkloadFeatures]:
@@ -638,36 +718,73 @@ class VLLMAdaptationLayer:
             self._maybe_decay(op, now)
             cluster = self._assign_cluster(op, feature_vec, now)
             self._match_history[op].append(cluster.cluster_id)
-            if throughput is not None and cluster.optimizer is not None:
-                if cluster.config is not None:
-                    cluster.optimizer.observe(cluster.config, throughput)
+            if throughput is not None:
+                self._observation_count[op] += 1
+                self._maybe_record_probe_result(op, cluster, throughput, now)
 
-            if self._should_trigger_tuning(op, cluster, now):
-                self._start_tuning_job(op, cluster)
+            self._maybe_enter_tuning(op, cluster, now)
 
-            decision = self._maybe_switch(op, now)
+            decision = self._maybe_probe(op, cluster, now)
+            if decision is None:
+                decision = self._maybe_switch(op, now)
             self._maybe_log_cluster_state(op, now)
 
         return decision
 
-    def apply_config(self, op: Any, config: Dict[str, Any]) -> bool:
+    def apply_config(self, op: Any, decision: SwitchDecision) -> bool:
+        config = decision.config
         if not config:
             return False
         apply_fn = getattr(op, "apply_adaptive_config", None)
         if callable(apply_fn):
             try:
-                return bool(apply_fn(config))
+                applied = bool(apply_fn(config))
             except Exception:
                 logger.exception("Failed to apply adaptive config for %s", getattr(op, "name", op))
                 return False
-        logger.info(
-            "Adaptive config ready for %s but no apply hook found: %s",
-            getattr(op, "name", op),
-            config,
-        )
-        return False
+        else:
+            logger.info(
+                "Adaptive config ready for %s but no apply hook found: %s",
+                getattr(op, "name", op),
+                config,
+            )
+            return False
+
+        if not applied:
+            return False
+
+        now = time.time()
+        with self._lock:
+            cluster = self._get_cluster(op, decision.cluster_id)
+            if decision.scope == ConfigApplyScope.PROBE:
+                if cluster is None:
+                    return applied
+                cluster.pending_config = dict(config)
+                cluster.pending_observation_count = self._observation_count[op]
+                logger.info(
+                    "vLLM adaptation: probe config applied for %s cluster %s",
+                    getattr(op, "name", op),
+                    decision.cluster_id,
+                )
+            elif decision.scope == ConfigApplyScope.ROLLOUT:
+                state = self._rollout_state.get(op)
+                if state is not None and state.cluster_id == decision.cluster_id:
+                    state.remaining -= 1
+                    state.last_update_time = now
+                    if state.remaining <= 0:
+                        self._rollout_state[op] = None
+                        if cluster is not None:
+                            cluster.needs_rollout = False
+                        logger.info(
+                            "vLLM adaptation: rollout completed for %s cluster %s",
+                            getattr(op, "name", op),
+                            decision.cluster_id,
+                        )
+        return applied
 
     def confirm_switch(self, op: Any, decision: SwitchDecision) -> None:
+        if decision.scope == ConfigApplyScope.PROBE:
+            return
         self._active_cluster[op] = decision.cluster_id
         self._last_switch_time[op] = time.time()
 
@@ -758,6 +875,9 @@ class VLLMAdaptationLayer:
         if cluster_b.status == ClusterStatus.TUNED:
             cluster_a.status = cluster_b.status
             cluster_a.config = cluster_b.config
+            cluster_a.needs_rollout = cluster_b.needs_rollout
+            cluster_a.last_tuned_centroid = cluster_b.last_tuned_centroid
+            cluster_a.last_tuned_time = cluster_b.last_tuned_time
         clusters.pop(j)
 
     def _should_trigger_tuning(
@@ -782,45 +902,101 @@ class VLLMAdaptationLayer:
             return drift >= self._centroid_drift_threshold
         return False
 
-    def _start_tuning_job(self, op: Any, cluster: WorkloadCluster) -> None:
-        key = (op, cluster.cluster_id)
-        if key in self._tuning_threads:
+    def _maybe_enter_tuning(self, op: Any, cluster: WorkloadCluster, now: float) -> None:
+        if not self._should_trigger_tuning(op, cluster, now):
             return
+        if cluster.optimizer is None:
+            cluster.optimizer = VLLMConfigOptimizer()
+        elif cluster.status == ClusterStatus.TUNED:
+            cluster.optimizer.reset()
         cluster.status = ClusterStatus.TUNING
-        self._last_tune_time[op] = time.time()
+        cluster.pending_config = None
+        cluster.pending_observation_count = -1
+        cluster.needs_rollout = False
+        self._last_tune_time[op] = now
         logger.info(
             "vLLM adaptation: tuning triggered for %s cluster %s",
             getattr(op, "name", op),
             cluster.cluster_id,
         )
 
-        def _tune():
-            try:
-                candidate = cluster.optimizer.suggest() if cluster.optimizer else {}
-                with self._lock:
-                    cluster.config = candidate
-                    cluster.status = ClusterStatus.TUNED
-                    cluster.last_tuned_centroid = list(cluster.centroid)
-                    cluster.last_tuned_time = time.time()
+    def _maybe_record_probe_result(
+        self, op: Any, cluster: WorkloadCluster, throughput: float, now: float
+    ) -> None:
+        if cluster.status != ClusterStatus.TUNING:
+            return
+        if cluster.pending_config is None or cluster.pending_observation_count < 0:
+            return
+        if self._observation_count[op] <= cluster.pending_observation_count:
+            return
+        if cluster.optimizer is None:
+            return
+        cluster.optimizer.observe(cluster.pending_config, throughput)
+        logger.info(
+            "vLLM adaptation: probe result for %s cluster %s (step %s/%s, throughput=%.4f)",
+            getattr(op, "name", op),
+            cluster.cluster_id,
+            cluster.optimizer.num_observations,
+            self._bo_steps_required,
+            throughput,
+        )
+        cluster.pending_config = None
+        cluster.pending_observation_count = -1
+        if cluster.optimizer.num_observations >= self._bo_steps_required:
+            best_config = cluster.optimizer.best_config
+            if best_config:
+                cluster.config = best_config
+                cluster.status = ClusterStatus.TUNED
+                cluster.needs_rollout = True
+                cluster.last_tuned_centroid = list(cluster.centroid)
+                cluster.last_tuned_time = now
                 logger.info(
-                    "Tuned config for %s cluster %s: %s",
+                    "vLLM adaptation: tuning completed for %s cluster %s after %s steps. best=%s",
                     getattr(op, "name", op),
                     cluster.cluster_id,
-                    candidate,
+                    cluster.optimizer.num_observations,
+                    best_config,
                 )
-            except Exception:
-                logger.exception("Failed to tune config for %s", getattr(op, "name", op))
-                with self._lock:
-                    cluster.status = ClusterStatus.PENDING
-            finally:
-                with self._lock:
-                    self._tuning_threads.pop(key, None)
 
-        thread = threading.Thread(target=_tune, daemon=True)
-        self._tuning_threads[key] = thread
-        thread.start()
+    def _maybe_probe(
+        self, op: Any, cluster: WorkloadCluster, now: float
+    ) -> Optional[SwitchDecision]:
+        if cluster.status != ClusterStatus.TUNING:
+            return None
+        if cluster.pending_config is not None:
+            return None
+        if cluster.optimizer is None:
+            return None
+        if cluster.optimizer.num_observations >= self._bo_steps_required:
+            return None
+        candidate = cluster.optimizer.suggest()
+        reason = (
+            f"bo probe step {cluster.optimizer.num_observations + 1}"
+            f"/{self._bo_steps_required}"
+        )
+        return SwitchDecision(
+            cluster_id=cluster.cluster_id,
+            config=candidate,
+            reason=reason,
+            scope=ConfigApplyScope.PROBE,
+        )
 
     def _maybe_switch(self, op: Any, now: float) -> Optional[SwitchDecision]:
+        rollout = self._rollout_state.get(op)
+        if rollout is not None:
+            cluster = self._get_cluster(op, rollout.cluster_id)
+            if cluster is None or cluster.config != rollout.config:
+                self._rollout_state[op] = None
+            elif rollout.remaining <= 0:
+                self._rollout_state[op] = None
+            elif now - rollout.last_update_time >= self._rollout_interval_s:
+                return SwitchDecision(
+                    cluster_id=rollout.cluster_id,
+                    config=rollout.config,
+                    reason=f"rollout remaining={rollout.remaining}",
+                    scope=ConfigApplyScope.ROLLOUT,
+                )
+
         if now - self._last_switch_time[op] < self._cooldown_s:
             return None
         history = self._match_history[op]
@@ -833,24 +1009,57 @@ class VLLMAdaptationLayer:
         dominant_id, count = dominant
         if count / len(history) < self._switch_consistency:
             return None
-        active = self._active_cluster[op]
-        if active == dominant_id:
-            return None
         cluster = self._get_cluster(op, dominant_id)
         if cluster is None or cluster.status != ClusterStatus.TUNED or not cluster.config:
             return None
-        decision = SwitchDecision(
+        active = self._active_cluster[op]
+        if active == dominant_id and not cluster.needs_rollout:
+            return None
+
+        rollout_count = self._get_actor_count(op)
+        if rollout_count <= 0:
+            return None
+        rollout_state = RolloutState(
             cluster_id=dominant_id,
-            config=cluster.config,
-            reason=f"dominant cluster {dominant_id} with {count}/{len(history)} matches",
+            config=dict(cluster.config),
+            remaining=rollout_count,
+            last_update_time=0.0,
+        )
+        self._rollout_state[op] = rollout_state
+        reason = (
+            f"dominant cluster {dominant_id} with {count}/{len(history)} matches; "
+            f"rollout={rollout_count}"
         )
         logger.info(
-            "vLLM adaptation: switch candidate for %s -> cluster %s (%s)",
+            "vLLM adaptation: rollout start for %s -> cluster %s (%s)",
             getattr(op, "name", op),
             dominant_id,
-            decision.reason,
+            reason,
         )
-        return decision
+        return SwitchDecision(
+            cluster_id=dominant_id,
+            config=rollout_state.config,
+            reason=reason,
+            scope=ConfigApplyScope.ROLLOUT,
+        )
+
+    def _get_actor_count(self, op: Any) -> int:
+        info_fn = getattr(op, "get_actor_info", None)
+        if callable(info_fn):
+            try:
+                info = info_fn()
+                running = getattr(info, "running", None)
+                if isinstance(running, int):
+                    return running
+            except Exception:
+                pass
+        actor_pool = getattr(op, "_actor_pool", None)
+        if actor_pool is not None:
+            try:
+                return int(actor_pool.num_running_actors())
+            except Exception:
+                return 0
+        return 0
 
     def _get_cluster(self, op: Any, cluster_id: int) -> Optional[WorkloadCluster]:
         for cluster in self._clusters[op]:
@@ -879,7 +1088,7 @@ class VLLMAdaptationLayer:
             logger.info("vLLM adaptation: cluster counts for %s: none", getattr(op, "name", op))
             return
         summary = ", ".join(
-            f\"{c.cluster_id}:{c.count:.2f}({c.status.value})\" for c in clusters
+            f"{c.cluster_id}:{c.count:.2f}({c.status.value})" for c in clusters
         )
         logger.info(
             "vLLM adaptation: cluster counts for %s: %s",

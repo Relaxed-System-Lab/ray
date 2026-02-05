@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 import ray
 from .autoscaler import Autoscaler
 from .autoscaling_actor_pool import ActorPoolScalingRequest
-from .adaptation_layer import VLLMAdaptationLayer
+from .adaptation_layer import ConfigApplyScope, VLLMAdaptationLayer
 from .observation_layer import VLLMObservationLayer
 from ray.data._internal.execution.interfaces.execution_options import ExecutionResources
 from ray.data._internal.execution.operators.actor_pool_map_operator import ActorPoolMapOperator
@@ -81,7 +81,13 @@ class DS2Autoscaler(Autoscaler):
         self._all_operators_initialized = False
         self._initialization_complete_time: Optional[float] = None
         self._observation_layer = VLLMObservationLayer(ema_alpha=self.EMA_ALPHA)
-        self._adaptation_layer = VLLMAdaptationLayer()
+        # Fast tuning defaults: fewer samples and BO steps, tighter cooldowns.
+        self._adaptation_layer = VLLMAdaptationLayer(
+            min_samples=3,
+            tuning_cooldown_s=30.0,
+            bo_steps_required=3,
+            rollout_interval_s=20.0,
+        )
 
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
@@ -223,20 +229,23 @@ class DS2Autoscaler(Autoscaler):
                             throughput=observed,
                         )
                         if decision is not None:
-                            applied = self._adaptation_layer.apply_config(op, decision.config)
+                            applied = self._adaptation_layer.apply_config(op, decision)
                             if applied:
-                                self._adaptation_layer.confirm_switch(op, decision)
-                                self._observation_layer.reset(op, queue_size=queue_size)
+                                if decision.scope == ConfigApplyScope.ROLLOUT:
+                                    self._adaptation_layer.confirm_switch(op, decision)
+                                    self._observation_layer.reset(op, queue_size=queue_size)
                                 logger.info(
-                                    "vLLM adaptation applied for %s (cluster %s).",
+                                    "vLLM adaptation applied for %s (cluster %s, scope=%s).",
                                     op.name,
                                     decision.cluster_id,
+                                    decision.scope.value,
                                 )
                             else:
                                 logger.info(
-                                    "vLLM adaptation candidate skipped for %s (cluster %s).",
+                                    "vLLM adaptation candidate skipped for %s (cluster %s, scope=%s).",
                                     op.name,
                                     decision.cluster_id,
+                                    decision.scope.value,
                                 )
                 else:
                     unit_throughput_list.append(raw_throughput)

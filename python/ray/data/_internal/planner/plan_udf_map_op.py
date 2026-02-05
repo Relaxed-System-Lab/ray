@@ -242,6 +242,9 @@ def plan_udf_map_op(
             transform_fn, init_fn
         )
 
+    if isinstance(op._fn, CallableClass):
+        map_transformer._udf_constructor_kwargs = op._fn_constructor_kwargs
+
     return MapOperator.create(
         map_transformer,
         input_physical_dag,
@@ -265,7 +268,9 @@ def _get_udf(op: AbstractUDFMap):
 
     if isinstance(udf, CallableClass):
         fn_constructor_args = op._fn_constructor_args or ()
-        fn_constructor_kwargs = op._fn_constructor_kwargs or {}
+        if op._fn_constructor_kwargs is None:
+            op._fn_constructor_kwargs = {}
+        fn_constructor_kwargs = op._fn_constructor_kwargs
 
         is_async_udf = _is_async_udf(udf.__call__)
 
