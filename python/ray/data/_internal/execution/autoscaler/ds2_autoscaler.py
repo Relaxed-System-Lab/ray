@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 import ray
 from .autoscaler import Autoscaler
 from .autoscaling_actor_pool import ActorPoolScalingRequest
+from .adaptation_layer import VLLMAdaptationLayer
 from .observation_layer import VLLMObservationLayer
 from ray.data._internal.execution.interfaces.execution_options import ExecutionResources
 from ray.data._internal.execution.operators.actor_pool_map_operator import ActorPoolMapOperator
@@ -52,6 +53,7 @@ class DS2Autoscaler(Autoscaler):
     # Default time horizon for planning (seconds)
     DEFAULT_TIME_HORIZON = 60.0
     MIN_THROUGHPUT_FALLBACK = 0.001
+    MIN_D_I_FALLBACK = 1.0
 
     def __init__(
         self,
@@ -79,6 +81,7 @@ class DS2Autoscaler(Autoscaler):
         self._all_operators_initialized = False
         self._initialization_complete_time: Optional[float] = None
         self._observation_layer = VLLMObservationLayer(ema_alpha=self.EMA_ALPHA)
+        self._adaptation_layer = VLLMAdaptationLayer()
 
     def try_trigger_scaling(self):
         """Try to trigger DS2 autoscaling."""
@@ -208,10 +211,33 @@ class DS2Autoscaler(Autoscaler):
                         delta_rows=num_rows,
                         delta_wall_time=wall_time,
                         queue_size=queue_size,
-                        pool_util=op.get_pool_util(),
+                        pool_util=self._get_pool_util(op),
                         avg_rows_per_bundle=avg_rows_per_bundle,
                     )
                     unit_throughput_list.append(observed)
+                    features = self._adaptation_layer.extract_features(op, op_state)
+                    if features is not None:
+                        decision = self._adaptation_layer.observe(
+                            op=op,
+                            features=features,
+                            throughput=observed,
+                        )
+                        if decision is not None:
+                            applied = self._adaptation_layer.apply_config(op, decision.config)
+                            if applied:
+                                self._adaptation_layer.confirm_switch(op, decision)
+                                self._observation_layer.reset(op, queue_size=queue_size)
+                                logger.info(
+                                    "vLLM adaptation applied for %s (cluster %s).",
+                                    op.name,
+                                    decision.cluster_id,
+                                )
+                            else:
+                                logger.info(
+                                    "vLLM adaptation candidate skipped for %s (cluster %s).",
+                                    op.name,
+                                    decision.cluster_id,
+                                )
                 else:
                     unit_throughput_list.append(raw_throughput)
 
@@ -258,7 +284,7 @@ class DS2Autoscaler(Autoscaler):
 
         if concurrency_list is None:
             logger.warning("MILP solver returned None. Skipping DS2 autoscaling.")
-            raise ValueError("MILP solver returned None.")
+            return
 
         RESERVE_CPU_FRACTION = 0.05
         # Post-processing: scale up CPU-only operators to maximize CPU utilization
@@ -349,16 +375,23 @@ class DS2Autoscaler(Autoscaler):
             List of target concurrency for each operator, or None if solver failed.
         """
         D_i = [float(x) for x in delta_num_processed_rows_list]
+        D_i_safe = [di if di > 0 else self.MIN_D_I_FALLBACK for di in D_i]
+        if D_i != D_i_safe:
+            logger.warning(
+                "Some D_i values are <= 0; using fallback %s for solver stability. D_i=%s",
+                self.MIN_D_I_FALLBACK,
+                D_i,
+            )
         logger.info(f"n={n}, ut={unit_throughput_list}, cpu_usage={cpu_usage_list},"
                     f"gpu_usage={gpu_usage_list},"
-                    f"D_i={D_i}, D_o={D_o}, N_cpu={N_cpu}, N_gpu={N_gpu}")
+                    f"D_i={D_i_safe}, D_o={D_o}, N_cpu={N_cpu}, N_gpu={N_gpu}")
 
         if self._solver_type == SolverType.BASIC:
             # Original solver without queue size consideration
 
             return milp_solver(
                 n, unit_throughput_list, cpu_usage_list, gpu_usage_list,
-                delta_num_processed_rows_list, D_o, N_cpu, N_gpu,
+                D_i_safe, D_o, N_cpu, N_gpu,
             )
 
         elif self._solver_type == SolverType.QUEUE_DIGESTION:
@@ -379,7 +412,7 @@ class DS2Autoscaler(Autoscaler):
                 UT=unit_throughput_list,
                 u=cpu_usage_list,
                 g=gpu_usage_list,
-                D_i=D_i,
+                D_i=D_i_safe,
                 D_o=D_o,
                 N_cpu=N_cpu,
                 N_gpu=N_gpu,
@@ -407,7 +440,7 @@ class DS2Autoscaler(Autoscaler):
                 UT=unit_throughput_list,
                 u=cpu_usage_list,
                 g=gpu_usage_list,
-                D_i=D_i,
+                D_i=D_i_safe,
                 D_o=D_o,
                 N_cpu=N_cpu,
                 N_gpu=N_gpu,
@@ -437,7 +470,7 @@ class DS2Autoscaler(Autoscaler):
                 UT=unit_throughput_list,
                 u=cpu_usage_list,
                 g=gpu_usage_list,
-                D_i=D_i,
+                D_i=D_i_safe,
                 D_o=D_o,
                 N_cpu=N_cpu,
                 N_gpu=N_gpu,
@@ -476,6 +509,22 @@ class DS2Autoscaler(Autoscaler):
         num_bundles = op_state.total_enqueued_input_bundles()
         avg_rows_per_bundle = self._estimate_avg_rows_per_bundle(op)
         return float(num_bundles) * avg_rows_per_bundle
+
+    def _get_pool_util(self, op: ActorPoolMapOperator) -> float:
+        """Best-effort pool utilization for observation layer filtering."""
+        if hasattr(op, "get_pool_util"):
+            try:
+                return op.get_pool_util()  # type: ignore[attr-defined]
+            except Exception:
+                logger.debug("Failed to fetch pool util via ActorPoolMapOperator.", exc_info=True)
+        try:
+            actor_pools = op.get_autoscaling_actor_pools()
+            if actor_pools:
+                return actor_pools[0].get_pool_util()
+        except Exception:
+            logger.debug("Failed to fetch pool util via actor pools.", exc_info=True)
+        # Fallback: treat as fully utilized to avoid over-filtering.
+        return 1.0
 
 
     def _postprocess_scale_cpu_operators(
@@ -695,6 +744,7 @@ class DS2Autoscaler(Autoscaler):
                 if self._is_vllm_op(op):
                     queue_size = self._get_queue_size_rows(op, op_state)
                     self._observation_layer.reset(op, queue_size=queue_size)
+                    self._adaptation_layer.reset(op)
         logger.info("Baseline metrics initialized for all operators.")
 
     def get_wall_time(self) -> List[float]:

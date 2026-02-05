@@ -2,6 +2,7 @@ import copy
 import functools
 import itertools
 import logging
+import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from typing import (
@@ -20,6 +21,7 @@ from typing import (
 import ray
 from ray import ObjectRef
 from ray._raylet import ObjectRefGenerator
+from ray.data.block import BlockAccessor
 from ray.data._internal.compute import (
     ActorPoolStrategy,
     ComputeStrategy,
@@ -60,6 +62,25 @@ from ray.data.context import DataContext
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 logger = logging.getLogger(__name__)
+
+
+class _TokenStats:
+    def __init__(self):
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, value: float) -> None:
+        self.count += 1
+        delta = value - self.mean
+        self.mean += delta / self.count
+        delta2 = value - self.mean
+        self.m2 += delta * delta2
+
+    def variance(self) -> float:
+        if self.count < 2:
+            return 0.0
+        return self.m2 / (self.count - 1)
 
 
 class MapOperator(OneToOneOperator, InternalQueueOperatorMixin, ABC):
@@ -116,6 +137,17 @@ class MapOperator(OneToOneOperator, InternalQueueOperatorMixin, ABC):
         self._next_metadata_task_idx = 0
         # Keep track of all finished streaming generators.
         super().__init__(name, input_op, data_context, target_max_block_size)
+
+        self._is_vllm_op = "vllm" in self._name.lower()
+        self._vllm_input_stats: Optional[_TokenStats] = (
+            _TokenStats() if self._is_vllm_op else None
+        )
+        self._vllm_output_stats: Optional[_TokenStats] = (
+            _TokenStats() if self._is_vllm_op else None
+        )
+        self._vllm_stats_lock: Optional[threading.Lock] = (
+            threading.Lock() if self._is_vllm_op else None
+        )
 
         # If set, then all output blocks will be split into
         # this many sub-blocks. This is to avoid having
@@ -400,6 +432,7 @@ class MapOperator(OneToOneOperator, InternalQueueOperatorMixin, ABC):
             # Since output is streamed, it should only contain one block.
             assert len(output) == 1
             self._metrics.on_task_output_generated(task_index, output)
+            self._maybe_update_vllm_token_stats(output)
 
             # Notify output queue that the task has produced an new output.
             self._output_queue.notify_task_output_ready(task_index, output)
@@ -440,6 +473,79 @@ class MapOperator(OneToOneOperator, InternalQueueOperatorMixin, ABC):
             lambda output: _output_ready_callback(task_index, output),
             functools.partial(_task_done_callback, task_index),
         )
+
+    def _maybe_update_vllm_token_stats(self, output: RefBundle) -> None:
+        if not self._is_vllm_op or self._vllm_stats_lock is None:
+            return
+        max_rows = 128
+        rows_seen = 0
+        for block_ref, _ in output.blocks:
+            try:
+                block = ray.get(block_ref)
+            except Exception:
+                continue
+            accessor = BlockAccessor.for_block(block)
+            for row in accessor.iter_rows(public_row_format=True):
+                for payload in self._iter_vllm_payloads(row):
+                    in_tokens = self._read_vllm_token_value(
+                        payload, "num_input_tokens", "prompt_token_ids"
+                    )
+                    out_tokens = self._read_vllm_token_value(
+                        payload, "num_generated_tokens", "generated_tokens"
+                    )
+                    with self._vllm_stats_lock:
+                        if in_tokens is not None and self._vllm_input_stats is not None:
+                            self._vllm_input_stats.update(in_tokens)
+                        if out_tokens is not None and self._vllm_output_stats is not None:
+                            self._vllm_output_stats.update(out_tokens)
+                    rows_seen += 1
+                    if rows_seen >= max_rows:
+                        return
+                if rows_seen >= max_rows:
+                    return
+
+    @staticmethod
+    def _iter_vllm_payloads(row: Any) -> Iterator[Any]:
+        payload = row
+        if isinstance(row, dict) and "__data" in row:
+            payload = row.get("__data")
+        if isinstance(payload, (list, tuple)):
+            for item in payload:
+                yield item
+        else:
+            yield payload
+
+    @staticmethod
+    def _read_vllm_token_value(
+        payload: Any,
+        count_key: str,
+        list_key: str,
+    ) -> Optional[float]:
+        value = None
+        if isinstance(payload, dict):
+            value = payload.get(count_key)
+            if value is None and list_key in payload:
+                try:
+                    value = len(payload.get(list_key) or [])
+                except Exception:
+                    value = None
+        else:
+            if hasattr(payload, count_key):
+                value = getattr(payload, count_key)
+            elif hasattr(payload, list_key):
+                try:
+                    value = len(getattr(payload, list_key) or [])
+                except Exception:
+                    value = None
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if value < 0:
+            return None
+        return value
 
     def _submit_metadata_task(
         self, result_ref: ObjectRef, task_done_callback: Callable[[], None]

@@ -451,6 +451,14 @@ class ActorPoolMapOperator(MapOperator):
             res["locality_misses"] = self._locality_misses
         res["pending_actors"] = self._actor_pool.num_pending_actors()
         res["restarting_actors"] = self._actor_pool.num_restarting_actors()
+        if self._is_vllm_op and self._vllm_input_stats is not None:
+            if self._vllm_input_stats.count > 0:
+                res["vllm_input_tokens_mean"] = self._vllm_input_stats.mean
+                res["vllm_input_tokens_var"] = self._vllm_input_stats.variance()
+        if self._is_vllm_op and self._vllm_output_stats is not None:
+            if self._vllm_output_stats.count > 0:
+                res["vllm_output_tokens_mean"] = self._vllm_output_stats.mean
+                res["vllm_output_tokens_var"] = self._vllm_output_stats.variance()
         return res
 
     @staticmethod
