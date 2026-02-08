@@ -659,6 +659,16 @@ class ActorPoolMapOperator(MapOperator):
         for logical_id in stale_generation_ids:
             self._logical_actor_generations.pop(logical_id, None)
 
+    @staticmethod
+    def _parse_positive_int(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
+
     def apply_adaptive_config(
         self,
         config: Dict[str, Any],
@@ -689,9 +699,32 @@ class ActorPoolMapOperator(MapOperator):
         if engine_kwargs is None or not isinstance(engine_kwargs, dict):
             engine_kwargs = {}
             constructor_kwargs["engine_kwargs"] = engine_kwargs
-        engine_kwargs.update(config)
 
-        config_key = self._stable_config_key(config)
+        applied_config = dict(config)
+        max_model_len = self._parse_positive_int(
+            applied_config.get("max_model_len", engine_kwargs.get("max_model_len"))
+        )
+        max_num_batched_tokens = self._parse_positive_int(
+            applied_config.get("max_num_batched_tokens")
+        )
+        if (
+            max_model_len is not None
+            and max_num_batched_tokens is not None
+            and max_num_batched_tokens < max_model_len
+        ):
+            logger.info(
+                "Adaptive config adjusted for %s: max_num_batched_tokens %s -> %s "
+                "to satisfy max_model_len=%s.",
+                self.name,
+                max_num_batched_tokens,
+                max_model_len,
+                max_model_len,
+            )
+            applied_config["max_num_batched_tokens"] = max_model_len
+
+        engine_kwargs.update(applied_config)
+
+        config_key = self._stable_config_key(applied_config)
         generation = self._adaptive_generation_by_config.get(config_key)
         if generation is None:
             generation = self._next_adaptive_generation()
@@ -704,12 +737,16 @@ class ActorPoolMapOperator(MapOperator):
             self.name,
             scope_text,
             generation,
-            config,
+            applied_config,
         )
         if scope_text == "default":
             return True
         if scope_text in ("probe", "rollout"):
-            return {"applied": True, "config_generation": generation}
+            return {
+                "applied": True,
+                "config_generation": generation,
+                "applied_config": dict(applied_config),
+            }
         return {"applied": False, "config_generation": None}
 
     def get_per_actor_resource_usage(self) -> ExecutionResources:
