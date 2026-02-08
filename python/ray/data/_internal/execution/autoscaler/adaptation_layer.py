@@ -84,6 +84,7 @@ class WorkloadCluster:
     count: float = 0.0
     status: ClusterStatus = ClusterStatus.PENDING
     config: Optional[Dict[str, Any]] = None
+    pending_probe: Optional["PendingProbe"] = None
     pending_config: Optional[Dict[str, Any]] = None
     pending_observation_count: int = -1
     needs_rollout: bool = False
@@ -99,6 +100,16 @@ class SwitchDecision:
     config: Dict[str, Any]
     reason: str
     scope: ConfigApplyScope
+    target_logical_actor_id: Optional[str] = None
+
+
+@dataclass
+class PendingProbe:
+    config: Dict[str, Any]
+    generation: Optional[int]
+    target_logical_actor_id: Optional[str]
+    applied_observation_count: int
+    applied_time_s: float
 
 
 @dataclass
@@ -651,6 +662,7 @@ class VLLMAdaptationLayer:
         tuning_cooldown_s: float = 60.0,
         bo_steps_required: int = 5,
         rollout_interval_s: float = 30.0,
+        probe_timeout_s: float = 120.0,
         prune_threshold: float = 0.1,
         cluster_log_interval_s: float = 60.0,
         feature_extractor: Optional[VLLMWorkloadFeatureExtractor] = None,
@@ -668,6 +680,7 @@ class VLLMAdaptationLayer:
         self._tuning_cooldown_s = tuning_cooldown_s
         self._bo_steps_required = bo_steps_required
         self._rollout_interval_s = rollout_interval_s
+        self._probe_timeout_s = probe_timeout_s
         self._prune_threshold = prune_threshold
         self._cluster_log_interval_s = cluster_log_interval_s
         self._feature_extractor = feature_extractor or VLLMWorkloadFeatureExtractor()
@@ -736,9 +749,17 @@ class VLLMAdaptationLayer:
         if not config:
             return False
         apply_fn = getattr(op, "apply_adaptive_config", None)
+        kwargs: Dict[str, Any] = {}
+        if decision.scope == ConfigApplyScope.PROBE:
+            kwargs["scope"] = "probe"
+            kwargs["probe_timeout_s"] = self._probe_timeout_s
+        elif decision.scope == ConfigApplyScope.ROLLOUT:
+            kwargs["scope"] = "rollout"
+            if decision.target_logical_actor_id is not None:
+                kwargs["target_logical_actor_id"] = decision.target_logical_actor_id
         if callable(apply_fn):
             try:
-                applied = bool(apply_fn(config))
+                result = apply_fn(config, **kwargs)
             except Exception:
                 logger.exception("Failed to apply adaptive config for %s", getattr(op, "name", op))
                 return False
@@ -750,6 +771,19 @@ class VLLMAdaptationLayer:
             )
             return False
 
+        if isinstance(result, dict):
+            applied = bool(result.get("applied"))
+            result_generation = result.get("config_generation")
+            try:
+                config_generation = (
+                    int(result_generation) if result_generation is not None else None
+                )
+            except (TypeError, ValueError):
+                config_generation = None
+        else:
+            applied = bool(result)
+            config_generation = None
+
         if not applied:
             return False
 
@@ -759,6 +793,13 @@ class VLLMAdaptationLayer:
             if decision.scope == ConfigApplyScope.PROBE:
                 if cluster is None:
                     return applied
+                cluster.pending_probe = PendingProbe(
+                    config=dict(config),
+                    generation=config_generation,
+                    target_logical_actor_id=decision.target_logical_actor_id,
+                    applied_observation_count=self._observation_count[op],
+                    applied_time_s=now,
+                )
                 cluster.pending_config = dict(config)
                 cluster.pending_observation_count = self._observation_count[op]
                 logger.info(
@@ -775,6 +816,7 @@ class VLLMAdaptationLayer:
                         self._rollout_state[op] = None
                         if cluster is not None:
                             cluster.needs_rollout = False
+                            cluster.pending_probe = None
                         logger.info(
                             "vLLM adaptation: rollout completed for %s cluster %s",
                             getattr(op, "name", op),
@@ -910,6 +952,7 @@ class VLLMAdaptationLayer:
         elif cluster.status == ClusterStatus.TUNED:
             cluster.optimizer.reset()
         cluster.status = ClusterStatus.TUNING
+        cluster.pending_probe = None
         cluster.pending_config = None
         cluster.pending_observation_count = -1
         cluster.needs_rollout = False
@@ -925,6 +968,53 @@ class VLLMAdaptationLayer:
     ) -> None:
         if cluster.status != ClusterStatus.TUNING:
             return
+
+        probe = cluster.pending_probe
+        if probe is not None:
+            observed = self._resolve_probe_throughput(op, probe)
+            if observed is not None:
+                if cluster.optimizer is None:
+                    return
+                cluster.optimizer.observe(probe.config, observed)
+                logger.info(
+                    "vLLM adaptation: probe result(actor-attributed) for %s cluster %s "
+                    "(step %s/%s, throughput=%.4f, generation=%s, actor=%s)",
+                    getattr(op, "name", op),
+                    cluster.cluster_id,
+                    cluster.optimizer.num_observations,
+                    self._bo_steps_required,
+                    observed,
+                    probe.generation,
+                    probe.target_logical_actor_id,
+                )
+                cluster.pending_probe = None
+                cluster.pending_config = None
+                cluster.pending_observation_count = -1
+                if cluster.optimizer.num_observations >= self._bo_steps_required:
+                    self._finalize_tuning_if_ready(cluster, now, op)
+                return
+
+            if (
+                self._probe_timeout_s > 0
+                and now - probe.applied_time_s >= self._probe_timeout_s
+            ):
+                logger.info(
+                    "vLLM adaptation: probe timed out for %s cluster %s "
+                    "(generation=%s, actor=%s)",
+                    getattr(op, "name", op),
+                    cluster.cluster_id,
+                    probe.generation,
+                    probe.target_logical_actor_id,
+                )
+                cluster.pending_probe = None
+                cluster.pending_config = None
+                cluster.pending_observation_count = -1
+                return
+
+            # Wait for actor-attributed throughput to become available.
+            # Do not fall back to op-level throughput while a probe is in flight.
+            return
+
         if cluster.pending_config is None or cluster.pending_observation_count < 0:
             return
         if self._observation_count[op] <= cluster.pending_observation_count:
@@ -943,25 +1033,14 @@ class VLLMAdaptationLayer:
         cluster.pending_config = None
         cluster.pending_observation_count = -1
         if cluster.optimizer.num_observations >= self._bo_steps_required:
-            best_config = cluster.optimizer.best_config
-            if best_config:
-                cluster.config = best_config
-                cluster.status = ClusterStatus.TUNED
-                cluster.needs_rollout = True
-                cluster.last_tuned_centroid = list(cluster.centroid)
-                cluster.last_tuned_time = now
-                logger.info(
-                    "vLLM adaptation: tuning completed for %s cluster %s after %s steps. best=%s",
-                    getattr(op, "name", op),
-                    cluster.cluster_id,
-                    cluster.optimizer.num_observations,
-                    best_config,
-                )
+            self._finalize_tuning_if_ready(cluster, now, op)
 
     def _maybe_probe(
         self, op: Any, cluster: WorkloadCluster, now: float
     ) -> Optional[SwitchDecision]:
         if cluster.status != ClusterStatus.TUNING:
+            return None
+        if cluster.pending_probe is not None:
             return None
         if cluster.pending_config is not None:
             return None
@@ -979,6 +1058,94 @@ class VLLMAdaptationLayer:
             config=candidate,
             reason=reason,
             scope=ConfigApplyScope.PROBE,
+            target_logical_actor_id=self._pick_rollout_target_actor(op, candidate),
+        )
+
+    def _resolve_probe_throughput(
+        self,
+        op: Any,
+        probe: PendingProbe,
+    ) -> Optional[float]:
+        snapshot_fn = getattr(op, "get_actor_adaptation_snapshot", None)
+        if not callable(snapshot_fn):
+            return None
+        try:
+            snapshot = snapshot_fn()
+        except Exception:
+            logger.debug(
+                "vLLM adaptation: failed to fetch actor adaptation snapshot for %s",
+                getattr(op, "name", op),
+                exc_info=True,
+            )
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+
+        actors = snapshot.get("actors")
+        throughputs = snapshot.get("throughputs_rows_s")
+        if not isinstance(actors, list) or not isinstance(throughputs, dict):
+            return None
+
+        target_actor_ids: List[str] = []
+        if probe.target_logical_actor_id is not None:
+            target_actor_ids.append(probe.target_logical_actor_id)
+
+        generation = probe.generation
+        if generation is not None:
+            for actor in actors:
+                if not isinstance(actor, dict):
+                    continue
+                if actor.get("config_generation") != generation:
+                    continue
+                actor_id = actor.get("logical_id")
+                if isinstance(actor_id, str):
+                    target_actor_ids.append(actor_id)
+
+        if not target_actor_ids:
+            return None
+
+        seen: set = set()
+        values: List[float] = []
+        for actor_id in target_actor_ids:
+            if actor_id in seen:
+                continue
+            seen.add(actor_id)
+            value = throughputs.get(actor_id)
+            try:
+                throughput = float(value)
+            except (TypeError, ValueError):
+                continue
+            if throughput > 0:
+                values.append(throughput)
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def _finalize_tuning_if_ready(
+        self,
+        cluster: WorkloadCluster,
+        now: float,
+        op: Any,
+    ) -> None:
+        if cluster.optimizer is None:
+            return
+        if cluster.optimizer.num_observations < self._bo_steps_required:
+            return
+        best_config = cluster.optimizer.best_config
+        if not best_config:
+            return
+        cluster.config = best_config
+        cluster.status = ClusterStatus.TUNED
+        cluster.needs_rollout = True
+        cluster.pending_probe = None
+        cluster.last_tuned_centroid = list(cluster.centroid)
+        cluster.last_tuned_time = now
+        logger.info(
+            "vLLM adaptation: tuning completed for %s cluster %s after %s steps. best=%s",
+            getattr(op, "name", op),
+            cluster.cluster_id,
+            cluster.optimizer.num_observations,
+            best_config,
         )
 
     def _maybe_switch(self, op: Any, now: float) -> Optional[SwitchDecision]:
@@ -990,11 +1157,16 @@ class VLLMAdaptationLayer:
             elif rollout.remaining <= 0:
                 self._rollout_state[op] = None
             elif now - rollout.last_update_time >= self._rollout_interval_s:
+                target_logical_actor_id = self._pick_rollout_target_actor(
+                    op,
+                    rollout.config,
+                )
                 return SwitchDecision(
                     cluster_id=rollout.cluster_id,
                     config=rollout.config,
                     reason=f"rollout remaining={rollout.remaining}",
                     scope=ConfigApplyScope.ROLLOUT,
+                    target_logical_actor_id=target_logical_actor_id,
                 )
 
         if now - self._last_switch_time[op] < self._cooldown_s:
@@ -1041,7 +1213,60 @@ class VLLMAdaptationLayer:
             config=rollout_state.config,
             reason=reason,
             scope=ConfigApplyScope.ROLLOUT,
+            target_logical_actor_id=self._pick_rollout_target_actor(op, rollout_state.config),
         )
+
+    def _pick_rollout_target_actor(
+        self,
+        op: Any,
+        target_config: Dict[str, Any],
+    ) -> Optional[str]:
+        snapshot_fn = getattr(op, "get_actor_adaptation_snapshot", None)
+        if not callable(snapshot_fn):
+            return None
+        try:
+            snapshot = snapshot_fn()
+        except Exception:
+            logger.debug(
+                "vLLM adaptation: failed to fetch actor snapshot for rollout target on %s",
+                getattr(op, "name", op),
+                exc_info=True,
+            )
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+
+        actors = snapshot.get("actors")
+        default_generation = snapshot.get("default_generation")
+        if not isinstance(actors, list):
+            return None
+
+        target_generation: Optional[int] = None
+        config_generation_fn = getattr(op, "get_config_generation", None)
+        if callable(config_generation_fn):
+            try:
+                target_generation = config_generation_fn(target_config)
+            except Exception:
+                target_generation = None
+
+        for actor in actors:
+            if not isinstance(actor, dict):
+                continue
+            actor_id = actor.get("logical_id")
+            if not isinstance(actor_id, str):
+                continue
+            if actor.get("state") != "running":
+                continue
+            if actor.get("marked_for_removal"):
+                continue
+            generation = actor.get("config_generation")
+            if target_generation is not None:
+                if generation != target_generation:
+                    return actor_id
+            elif default_generation is not None and generation != default_generation:
+                return actor_id
+
+        return None
 
     def _get_actor_count(self, op: Any) -> int:
         info_fn = getattr(op, "get_actor_info", None)

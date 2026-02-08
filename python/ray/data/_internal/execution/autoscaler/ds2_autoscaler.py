@@ -1,7 +1,7 @@
 import logging
 import time
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import ray
 from .autoscaler import Autoscaler
@@ -229,7 +229,7 @@ class DS2Autoscaler(Autoscaler):
                             throughput=observed,
                         )
                         if decision is not None:
-                            applied = self._adaptation_layer.apply_config(op, decision)
+                            applied = self._apply_adaptive_config(op, decision)
                             if applied:
                                 if decision.scope == ConfigApplyScope.ROLLOUT:
                                     self._adaptation_layer.confirm_switch(op, decision)
@@ -867,6 +867,120 @@ class DS2Autoscaler(Autoscaler):
             return metrics.rows_task_inputs_processed / metrics.num_task_inputs_processed
         # Fallback: if no processed data yet, return 1.0 (bundle count = row count estimate)
         return 1.0
+
+    def _apply_adaptive_config(self, op: ActorPoolMapOperator, decision: Any) -> bool:
+        config = getattr(decision, "config", None)
+        if not isinstance(config, dict) or not config:
+            return False
+
+        actor_pool = self._resolve_actor_pool(op)
+        should_replace_actor = actor_pool is not None and callable(
+            getattr(actor_pool, "my_scale_down", None)
+        )
+        if should_replace_actor and not self._begin_actor_replacement(op, actor_pool):
+            return False
+
+        applied = self._adaptation_layer.apply_config(op, decision)
+        if not applied:
+            if should_replace_actor:
+                self._restore_actor_capacity(op, actor_pool)
+            return False
+
+        if should_replace_actor and not self._upscale_actor_pool(
+            op,
+            actor_pool,
+            reason="vLLM adaptive config update",
+        ):
+            return False
+
+        return True
+
+    @staticmethod
+    def _resolve_actor_pool(op: ActorPoolMapOperator) -> Optional[Any]:
+        pools_fn = getattr(op, "get_autoscaling_actor_pools", None)
+        if callable(pools_fn):
+            try:
+                pools = pools_fn()
+                if pools:
+                    return pools[0]
+            except Exception:
+                logger.exception(
+                    "Failed to get autoscaling actor pools for %s",
+                    getattr(op, "name", op),
+                )
+
+        actor_pool = getattr(op, "_actor_pool", None)
+        if actor_pool is not None:
+            return actor_pool
+        return None
+
+    def _begin_actor_replacement(self, op: ActorPoolMapOperator, actor_pool: Any) -> bool:
+        try:
+            num_removed, num_marked = actor_pool.my_scale_down(
+                target_num_actors=1,
+                forced=False,
+            )
+        except TypeError:
+            num_removed, num_marked = actor_pool.my_scale_down(1, False)
+        except Exception:
+            logger.exception(
+                "Failed to scale down actor pool for adaptive config update on %s",
+                getattr(op, "name", op),
+            )
+            return False
+
+        if (num_removed + num_marked) <= 0:
+            logger.info(
+                "Adaptive config skipped for %s: no actor available for replacement "
+                "(removed=%s, marked=%s).",
+                getattr(op, "name", op),
+                num_removed,
+                num_marked,
+            )
+            return False
+
+        logger.info(
+            "Adaptive config replacement accepted for %s "
+            "(removed=%s, marked=%s).",
+            getattr(op, "name", op),
+            num_removed,
+            num_marked,
+        )
+        return True
+
+    def _upscale_actor_pool(
+        self,
+        op: ActorPoolMapOperator,
+        actor_pool: Any,
+        *,
+        reason: str,
+    ) -> bool:
+        try:
+            actor_pool.scale(
+                ActorPoolScalingRequest.upscale(
+                    delta=1,
+                    reason=reason,
+                )
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Failed to scale up actor pool for adaptive config update on %s",
+                getattr(op, "name", op),
+            )
+            return False
+
+    def _restore_actor_capacity(self, op: ActorPoolMapOperator, actor_pool: Any) -> None:
+        recovered = self._upscale_actor_pool(
+            op,
+            actor_pool,
+            reason="vLLM adaptive config rollback",
+        )
+        if not recovered:
+            logger.error(
+                "Failed to restore actor capacity for %s after adaptive config failure.",
+                getattr(op, "name", op),
+            )
 
     def get_queue_sizes(self) -> List[float]:
         """Get current queue sizes in rows for each operator.

@@ -1,4 +1,5 @@
 import abc
+import json
 import logging
 import time
 import uuid
@@ -172,6 +173,18 @@ class ActorPoolMapOperator(MapOperator):
         self._locality_hits = 0
         self._locality_misses = 0
 
+        # vLLM adaptive config tracking for actor-level attribution.
+        self._adaptive_default_generation: int = 0
+        self._adaptive_next_generation: int = 0
+        self._adaptive_generation_by_config: Dict[str, int] = {}
+        self._logical_actor_generations: Dict[str, int] = {}
+
+        # Lightweight per-actor throughput estimate derived from task completions.
+        # task_idx -> (logical_actor_id, submit_time_s, input_rows)
+        self._actor_task_samples: Dict[int, Tuple[Optional[str], float, float]] = {}
+        self._actor_throughputs_rows_s: Dict[str, float] = {}
+        self._actor_throughput_ewma_alpha: float = 0.3
+
     @staticmethod
     def _create_task_selector(actor_pool: "_ActorPool") -> "_ActorTaskSelector":
         return _ActorTaskSelectorImpl(actor_pool)
@@ -257,6 +270,13 @@ class ActorPoolMapOperator(MapOperator):
         ctx = self.data_context
         if self._ray_remote_args_fn:
             self._refresh_actor_cls()
+
+        logical_actor_id = labels.get(self._actor_pool.get_logical_id_label_key())
+        if isinstance(logical_actor_id, str):
+            self._logical_actor_generations[logical_actor_id] = (
+                self._adaptive_default_generation
+            )
+
         actor = self._cls.options(
             _labels={self._OPERATOR_ID_LABEL_KEY: self.id, **labels}
         ).remote(
@@ -304,8 +324,16 @@ class ActorPoolMapOperator(MapOperator):
             input_blocks = [block for block, _ in bundle.blocks]
             self._actor_pool.on_task_submitted(actor)
 
+            task_index = self._next_data_task_idx
+            logical_actor_id = self._actor_pool.get_logical_id(actor)
+            self._record_actor_task_submission(
+                task_index=task_index,
+                logical_actor_id=logical_actor_id,
+                bundle=bundle,
+            )
+
             ctx = TaskContext(
-                task_idx=self._next_data_task_idx,
+                task_idx=task_index,
                 op_name=self.name,
                 target_max_block_size=self.actual_target_max_block_size,
             )
@@ -320,7 +348,8 @@ class ActorPoolMapOperator(MapOperator):
                 **self.get_map_task_kwargs(),
             )
 
-            def _task_done_callback(actor_to_return):
+            def _task_done_callback(actor_to_return, task_idx):
+                self._record_actor_task_completion(task_idx)
                 # Return the actor that was running the task to the pool.
                 self._actor_pool.on_task_completed(actor_to_return)
                 # Dipsatch more tasks.
@@ -329,7 +358,13 @@ class ActorPoolMapOperator(MapOperator):
             from functools import partial
 
             self._submit_data_task(
-                gen, bundle, partial(_task_done_callback, actor_to_return=actor)
+                gen,
+                bundle,
+                partial(
+                    _task_done_callback,
+                    actor_to_return=actor,
+                    task_idx=task_index,
+                ),
             )
 
             # Update locality metrics
@@ -506,7 +541,133 @@ class ActorPoolMapOperator(MapOperator):
         """Returns Actor counts for Alive, Restarting and Pending Actors."""
         return self._actor_pool.get_actor_info()
 
-    def apply_adaptive_config(self, config: Dict[str, Any]) -> bool:
+    @staticmethod
+    def _stable_config_key(config: Dict[str, Any]) -> str:
+        try:
+            return json.dumps(config, sort_keys=True, default=str)
+        except Exception:
+            return str(sorted((str(k), str(v)) for k, v in config.items()))
+
+    def _next_adaptive_generation(self) -> int:
+        self._adaptive_next_generation += 1
+        return self._adaptive_next_generation
+
+    def get_config_generation(self, config: Dict[str, Any]) -> Optional[int]:
+        config_key = self._stable_config_key(config)
+        return self._adaptive_generation_by_config.get(config_key)
+
+    def get_actor_adaptation_snapshot(self) -> Dict[str, Any]:
+        actor_pool = self._actor_pool
+        self._cleanup_removed_actor_stats()
+        actors: List[Dict[str, Any]] = []
+
+        for actor, state in actor_pool.running_actors().items():
+            logical_id = actor_pool.get_logical_id(actor)
+            generation = (
+                self._logical_actor_generations.get(logical_id, self._adaptive_default_generation)
+                if logical_id is not None
+                else self._adaptive_default_generation
+            )
+            actors.append(
+                {
+                    "logical_id": logical_id,
+                    "state": "running",
+                    "marked_for_removal": actor_pool.is_actor_marked_for_removal(actor),
+                    "config_generation": generation,
+                    "config_hash": None,
+                }
+            )
+
+        pending_refs = actor_pool.get_pending_actor_refs()
+        for ready_ref in pending_refs:
+            logical_id = actor_pool.get_pending_logical_id(ready_ref)
+            generation = (
+                self._logical_actor_generations.get(logical_id, self._adaptive_default_generation)
+                if logical_id is not None
+                else self._adaptive_default_generation
+            )
+            actors.append(
+                {
+                    "logical_id": logical_id,
+                    "state": "pending",
+                    "marked_for_removal": False,
+                    "config_generation": generation,
+                    "config_hash": None,
+                }
+            )
+
+        throughputs_rows_s = {
+            logical_id: float(value)
+            for logical_id, value in self._actor_throughputs_rows_s.items()
+        }
+        return {
+            "time_s": time.time(),
+            "default_generation": self._adaptive_default_generation,
+            "autoscaler_target_concurrency": actor_pool.current_size(),
+            "actors": actors,
+            "throughputs_rows_s": throughputs_rows_s,
+        }
+
+    def _record_actor_task_submission(
+        self,
+        *,
+        task_index: int,
+        logical_actor_id: Optional[str],
+        bundle: RefBundle,
+    ) -> None:
+        rows = bundle.num_rows() or 0
+        self._actor_task_samples[task_index] = (logical_actor_id, time.perf_counter(), float(rows))
+
+    def _record_actor_task_completion(self, task_index: int) -> None:
+        sample = self._actor_task_samples.pop(task_index, None)
+        if sample is None:
+            return
+        logical_actor_id, submit_time, input_rows = sample
+        if logical_actor_id is None:
+            return
+        if input_rows <= 0:
+            return
+        duration = time.perf_counter() - submit_time
+        if duration <= 0:
+            return
+
+        throughput = input_rows / duration
+        prev = self._actor_throughputs_rows_s.get(logical_actor_id)
+        if prev is None:
+            self._actor_throughputs_rows_s[logical_actor_id] = throughput
+        else:
+            alpha = self._actor_throughput_ewma_alpha
+            self._actor_throughputs_rows_s[logical_actor_id] = (
+                alpha * throughput + (1.0 - alpha) * prev
+            )
+
+    def _cleanup_removed_actor_stats(self) -> None:
+        valid_logical_ids = set(self._actor_pool.get_logical_ids())
+        stale_ids = [
+            logical_id
+            for logical_id in self._actor_throughputs_rows_s
+            if logical_id not in valid_logical_ids
+        ]
+        for logical_id in stale_ids:
+            self._actor_throughputs_rows_s.pop(logical_id, None)
+
+        stale_generation_ids = [
+            logical_id
+            for logical_id in self._logical_actor_generations
+            if logical_id not in valid_logical_ids
+        ]
+        for logical_id in stale_generation_ids:
+            self._logical_actor_generations.pop(logical_id, None)
+
+    def apply_adaptive_config(
+        self,
+        config: Dict[str, Any],
+        *,
+        scope: Optional[str] = None,
+        target_logical_actor_id: Optional[str] = None,
+        probe_timeout_s: Optional[float] = None,
+    ) -> Union[bool, Dict[str, Any]]:
+        del target_logical_actor_id, probe_timeout_s
         if not config:
             return False
         if not self._is_vllm_op:
@@ -524,33 +685,32 @@ class ActorPoolMapOperator(MapOperator):
             )
             return False
 
-        num_removed, num_marked = self._actor_pool.my_scale_down(1, forced=False)
-        if num_removed <= 0:
-            logger.info(
-                "Adaptive config prepared for %s but no idle actor removed (marked=%s).",
-                self.name,
-                num_marked,
-            )
-            return False
-
         engine_kwargs = constructor_kwargs.get("engine_kwargs")
         if engine_kwargs is None or not isinstance(engine_kwargs, dict):
             engine_kwargs = {}
             constructor_kwargs["engine_kwargs"] = engine_kwargs
         engine_kwargs.update(config)
 
-        self._actor_pool.scale(
-            ActorPoolScalingRequest.upscale(
-                delta=1,
-                reason="vLLM adaptive config update",
-            )
-        )
+        config_key = self._stable_config_key(config)
+        generation = self._adaptive_generation_by_config.get(config_key)
+        if generation is None:
+            generation = self._next_adaptive_generation()
+            self._adaptive_generation_by_config[config_key] = generation
+        self._adaptive_default_generation = generation
+
+        scope_text = scope.lower() if isinstance(scope, str) else "default"
         logger.info(
-            "Adaptive config applied for %s (one actor updated): %s",
+            "Adaptive config prepared for %s (scope=%s, generation=%s): %s",
             self.name,
+            scope_text,
+            generation,
             config,
         )
-        return True
+        if scope_text == "default":
+            return True
+        if scope_text in ("probe", "rollout"):
+            return {"applied": True, "config_generation": generation}
+        return {"applied": False, "config_generation": None}
 
     def get_per_actor_resource_usage(self) -> ExecutionResources:
         return self._actor_pool._per_actor_resource_usage
@@ -1144,6 +1304,15 @@ class _ActorPool(AutoscalingActorPool):
 
     def get_running_actor_refs(self) -> List[ray.ObjectRef]:
         return list(self._running_actors.keys())
+
+    def get_logical_id(self, actor: ray.actor.ActorHandle) -> Optional[str]:
+        return self._actor_to_logical_id.get(actor)
+
+    def get_pending_logical_id(self, ready_ref: ObjectRef) -> Optional[str]:
+        actor = self._pending_actors.get(ready_ref)
+        if actor is None:
+            return None
+        return self._actor_to_logical_id.get(actor)
 
     def get_logical_ids(self) -> List[str]:
         """Get the logical IDs for pending and running actors in the actor pool.
