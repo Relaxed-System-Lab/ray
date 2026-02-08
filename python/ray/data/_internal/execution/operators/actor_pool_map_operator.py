@@ -178,6 +178,10 @@ class ActorPoolMapOperator(MapOperator):
         self._adaptive_next_generation: int = 0
         self._adaptive_generation_by_config: Dict[str, int] = {}
         self._logical_actor_generations: Dict[str, int] = {}
+        self._adaptive_max_num_batched_tokens_cap: Optional[int] = None
+        self._adaptive_max_num_seqs_cap: Optional[int] = None
+        self._adaptive_engine_kwargs_baseline: Optional[Dict[str, Any]] = None
+        self._adaptive_allowed_override_keys: Optional[Set[str]] = None
 
         # Lightweight per-actor throughput estimate derived from task completions.
         # task_idx -> (logical_actor_id, submit_time_s, input_rows)
@@ -669,6 +673,54 @@ class ActorPoolMapOperator(MapOperator):
             return None
         return parsed
 
+    def _resolve_max_num_batched_tokens_cap(
+        self,
+        engine_kwargs: Dict[str, Any],
+        max_model_len: Optional[int],
+    ) -> Optional[int]:
+        if self._adaptive_max_num_batched_tokens_cap is not None:
+            return self._adaptive_max_num_batched_tokens_cap
+
+        if "max_num_batched_tokens" not in engine_kwargs:
+            return None
+
+        configured_cap = self._parse_positive_int(
+            engine_kwargs.get("max_num_batched_tokens")
+        )
+        candidates = [
+            value
+            for value in (configured_cap, max_model_len)
+            if value is not None
+        ]
+        if not candidates:
+            return None
+
+        self._adaptive_max_num_batched_tokens_cap = max(candidates)
+        return self._adaptive_max_num_batched_tokens_cap
+
+    def _resolve_max_num_seqs_cap(self, engine_kwargs: Dict[str, Any]) -> Optional[int]:
+        if self._adaptive_max_num_seqs_cap is not None:
+            return self._adaptive_max_num_seqs_cap
+
+        configured_cap = self._parse_positive_int(engine_kwargs.get("max_num_seqs"))
+        if configured_cap is None:
+            return None
+
+        self._adaptive_max_num_seqs_cap = configured_cap
+        return self._adaptive_max_num_seqs_cap
+
+    def _initialize_adaptive_baseline(self, engine_kwargs: Dict[str, Any]) -> None:
+        if self._adaptive_engine_kwargs_baseline is not None:
+            return
+
+        self._adaptive_engine_kwargs_baseline = dict(engine_kwargs)
+        baseline_keys = set(self._adaptive_engine_kwargs_baseline.keys())
+        allowed_override_keys = set(baseline_keys)
+        allowed_override_keys.add("max_num_seqs")
+        if "max_num_batched_tokens" in baseline_keys:
+            allowed_override_keys.add("max_num_batched_tokens")
+        self._adaptive_allowed_override_keys = allowed_override_keys
+
     def apply_adaptive_config(
         self,
         config: Dict[str, Any],
@@ -700,10 +752,53 @@ class ActorPoolMapOperator(MapOperator):
             engine_kwargs = {}
             constructor_kwargs["engine_kwargs"] = engine_kwargs
 
+        self._initialize_adaptive_baseline(engine_kwargs)
+        baseline_engine_kwargs = self._adaptive_engine_kwargs_baseline or {}
+        allowed_override_keys = self._adaptive_allowed_override_keys or {"max_num_seqs"}
+
         applied_config = dict(config)
-        max_model_len = self._parse_positive_int(
-            applied_config.get("max_model_len", engine_kwargs.get("max_model_len"))
+        ignored_override_keys = sorted(
+            key for key in applied_config if key not in allowed_override_keys
         )
+        for key in ignored_override_keys:
+            applied_config.pop(key, None)
+        if ignored_override_keys:
+            logger.info(
+                "Adaptive config keys ignored for %s due to safety policy: %s",
+                self.name,
+                ignored_override_keys,
+            )
+        if not applied_config:
+            logger.info(
+                "Adaptive config ignored for %s after safety filtering.",
+                self.name,
+            )
+            return False
+
+        max_model_len = self._parse_positive_int(
+            applied_config.get("max_model_len", baseline_engine_kwargs.get("max_model_len"))
+        )
+        max_num_batched_tokens_cap = self._resolve_max_num_batched_tokens_cap(
+            baseline_engine_kwargs,
+            max_model_len,
+        )
+        max_num_seqs_cap = self._resolve_max_num_seqs_cap(baseline_engine_kwargs)
+
+        max_num_seqs = self._parse_positive_int(applied_config.get("max_num_seqs"))
+        if (
+            max_num_seqs_cap is not None
+            and max_num_seqs is not None
+            and max_num_seqs > max_num_seqs_cap
+        ):
+            logger.info(
+                "Adaptive config adjusted for %s: max_num_seqs %s -> %s "
+                "to respect baseline safety cap.",
+                self.name,
+                max_num_seqs,
+                max_num_seqs_cap,
+            )
+            applied_config["max_num_seqs"] = max_num_seqs_cap
+
         max_num_batched_tokens = self._parse_positive_int(
             applied_config.get("max_num_batched_tokens")
         )
@@ -721,8 +816,25 @@ class ActorPoolMapOperator(MapOperator):
                 max_model_len,
             )
             applied_config["max_num_batched_tokens"] = max_model_len
+            max_num_batched_tokens = max_model_len
 
-        engine_kwargs.update(applied_config)
+        if (
+            max_num_batched_tokens_cap is not None
+            and max_num_batched_tokens is not None
+            and max_num_batched_tokens > max_num_batched_tokens_cap
+        ):
+            logger.info(
+                "Adaptive config adjusted for %s: max_num_batched_tokens %s -> %s "
+                "to respect baseline safety cap.",
+                self.name,
+                max_num_batched_tokens,
+                max_num_batched_tokens_cap,
+            )
+            applied_config["max_num_batched_tokens"] = max_num_batched_tokens_cap
+
+        next_engine_kwargs = dict(baseline_engine_kwargs)
+        next_engine_kwargs.update(applied_config)
+        constructor_kwargs["engine_kwargs"] = next_engine_kwargs
 
         config_key = self._stable_config_key(applied_config)
         generation = self._adaptive_generation_by_config.get(config_key)
