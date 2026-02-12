@@ -1,7 +1,9 @@
 import collections
 import gc
 import random
+import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Iterable, List
 from unittest.mock import MagicMock
 
@@ -32,6 +34,7 @@ from ray.data._internal.execution.operators.limit_operator import LimitOperator
 from ray.data._internal.execution.operators.map_operator import (
     MapOperator,
     _BlockRefBundler,
+    _TokenStats,
 )
 from ray.data._internal.execution.operators.map_transformer import (
     create_map_transformer_from_block_fn,
@@ -42,7 +45,7 @@ from ray.data._internal.execution.operators.task_pool_map_operator import (
 )
 from ray.data._internal.execution.util import make_ref_bundles
 from ray.data._internal.stats import Timer
-from ray.data.block import Block, BlockAccessor
+from ray.data.block import Block, BlockAccessor, BlockMetadata
 from ray.data.context import DataContext
 from ray.data.tests.util import run_one_op_task, run_op_tasks_sync
 from ray.tests.client_test_utils import create_remote_signal_actor
@@ -1232,6 +1235,50 @@ def test_input_data_buffer_does_not_free_inputs():
     # `InputDataBuffer` should still hold a reference to the input block even after
     # `get_next` is called.
     assert len(gc.get_referrers(block_ref)) > 0
+
+
+def test_map_operator_updates_vllm_stats_from_metadata_only():
+    op = MapOperator.__new__(MapOperator)
+    op._is_vllm_op = True
+    op._vllm_stats_lock = threading.Lock()
+    op._vllm_input_stats = _TokenStats()
+    op._vllm_output_stats = _TokenStats()
+
+    metadata = BlockMetadata(
+        num_rows=1,
+        size_bytes=1,
+        exec_stats=None,
+        input_files=[],
+        vllm_input_token_stats={"count": 2, "sum": 6, "sum_sq": 20},
+        vllm_output_token_stats={"count": 3, "sum": 18, "sum_sq": 110},
+    )
+
+    output = SimpleNamespace(metadata=[metadata])
+    op._maybe_update_vllm_token_stats(output)
+
+    assert op._vllm_input_stats.count == 2
+    assert op._vllm_input_stats.mean == pytest.approx(3.0)
+    assert op._vllm_input_stats.variance() == pytest.approx(2.0)
+
+    assert op._vllm_output_stats.count == 3
+    assert op._vllm_output_stats.mean == pytest.approx(6.0)
+    assert op._vllm_output_stats.variance() == pytest.approx(1.0)
+
+
+def test_map_operator_summarizes_vllm_token_stats_per_block():
+    block = pd.DataFrame(
+        {
+            "__data": [
+                {"num_input_tokens": 2, "num_generated_tokens": 5},
+                {"prompt_token_ids": [1, 2, 3], "generated_tokens": [4, 5]},
+            ]
+        }
+    )
+
+    input_stats, output_stats = MapOperator._summarize_vllm_token_stats_for_block(block)
+
+    assert input_stats == {"count": 2.0, "sum": 5.0, "sum_sq": 13.0}
+    assert output_stats == {"count": 2.0, "sum": 7.0, "sum_sq": 29.0}
 
 
 if __name__ == "__main__":

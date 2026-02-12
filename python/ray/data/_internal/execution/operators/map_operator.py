@@ -77,6 +77,27 @@ class _TokenStats:
         delta2 = value - self.mean
         self.m2 += delta * delta2
 
+    def merge_aggregates(self, count: int, value_sum: float, value_sum_sq: float) -> None:
+        if count <= 0:
+            return
+        if count == 1:
+            self.update(value_sum)
+            return
+
+        other_mean = value_sum / count
+        other_m2 = max(value_sum_sq - (value_sum * value_sum) / count, 0.0)
+        if self.count == 0:
+            self.count = count
+            self.mean = other_mean
+            self.m2 = other_m2
+            return
+
+        merged_count = self.count + count
+        delta = other_mean - self.mean
+        self.mean += delta * count / merged_count
+        self.m2 += other_m2 + delta * delta * self.count * count / merged_count
+        self.count = merged_count
+
     def variance(self) -> float:
         if self.count < 2:
             return 0.0
@@ -477,32 +498,102 @@ class MapOperator(OneToOneOperator, InternalQueueOperatorMixin, ABC):
     def _maybe_update_vllm_token_stats(self, output: RefBundle) -> None:
         if not self._is_vllm_op or self._vllm_stats_lock is None:
             return
-        max_rows = 128
-        rows_seen = 0
-        for block_ref, _ in output.blocks:
-            try:
-                block = ray.get(block_ref)
-            except Exception:
-                continue
-            accessor = BlockAccessor.for_block(block)
-            for row in accessor.iter_rows(public_row_format=True):
-                for payload in self._iter_vllm_payloads(row):
-                    in_tokens = self._read_vllm_token_value(
-                        payload, "num_input_tokens", "prompt_token_ids"
+        with self._vllm_stats_lock:
+            for metadata in output.metadata:
+                input_stats = self._parse_vllm_token_stats_summary(
+                    getattr(metadata, "vllm_input_token_stats", None)
+                )
+                if input_stats is not None and self._vllm_input_stats is not None:
+                    count, value_sum, value_sum_sq = input_stats
+                    self._vllm_input_stats.merge_aggregates(
+                        count=count,
+                        value_sum=value_sum,
+                        value_sum_sq=value_sum_sq,
                     )
-                    out_tokens = self._read_vllm_token_value(
-                        payload, "num_generated_tokens", "generated_tokens"
+                output_stats = self._parse_vllm_token_stats_summary(
+                    getattr(metadata, "vllm_output_token_stats", None)
+                )
+                if output_stats is not None and self._vllm_output_stats is not None:
+                    count, value_sum, value_sum_sq = output_stats
+                    self._vllm_output_stats.merge_aggregates(
+                        count=count,
+                        value_sum=value_sum,
+                        value_sum_sq=value_sum_sq,
                     )
-                    with self._vllm_stats_lock:
-                        if in_tokens is not None and self._vllm_input_stats is not None:
-                            self._vllm_input_stats.update(in_tokens)
-                        if out_tokens is not None and self._vllm_output_stats is not None:
-                            self._vllm_output_stats.update(out_tokens)
-                    rows_seen += 1
-                    if rows_seen >= max_rows:
-                        return
-                if rows_seen >= max_rows:
-                    return
+
+    @staticmethod
+    def _build_vllm_token_stats_summary(
+        count: int,
+        value_sum: float,
+        value_sum_sq: float,
+    ) -> Optional[Dict[str, float]]:
+        if count <= 0:
+            return None
+        return {
+            "count": float(count),
+            "sum": float(value_sum),
+            "sum_sq": float(value_sum_sq),
+        }
+
+    @staticmethod
+    def _parse_vllm_token_stats_summary(
+        summary: Any,
+    ) -> Optional[Tuple[int, float, float]]:
+        if not isinstance(summary, dict):
+            return None
+        try:
+            count_value = summary.get("count")
+            value_sum = float(summary.get("sum"))
+            value_sum_sq = float(summary.get("sum_sq"))
+            count = int(float(count_value))
+        except (TypeError, ValueError):
+            return None
+        if count <= 0:
+            return None
+        return count, value_sum, value_sum_sq
+
+    @staticmethod
+    def _summarize_vllm_token_stats_for_block(
+        block: Block,
+    ) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
+        accessor = BlockAccessor.for_block(block)
+        input_count = 0
+        input_sum = 0.0
+        input_sum_sq = 0.0
+        output_count = 0
+        output_sum = 0.0
+        output_sum_sq = 0.0
+
+        for row in accessor.iter_rows(public_row_format=True):
+            for payload in MapOperator._iter_vllm_payloads(row):
+                in_tokens = MapOperator._read_vllm_token_value(
+                    payload, "num_input_tokens", "prompt_token_ids"
+                )
+                if in_tokens is not None:
+                    input_count += 1
+                    input_sum += in_tokens
+                    input_sum_sq += in_tokens * in_tokens
+
+                out_tokens = MapOperator._read_vllm_token_value(
+                    payload, "num_generated_tokens", "generated_tokens"
+                )
+                if out_tokens is not None:
+                    output_count += 1
+                    output_sum += out_tokens
+                    output_sum_sq += out_tokens * out_tokens
+
+        return (
+            MapOperator._build_vllm_token_stats_summary(
+                input_count,
+                input_sum,
+                input_sum_sq,
+            ),
+            MapOperator._build_vllm_token_stats_summary(
+                output_count,
+                output_sum,
+                output_sum_sq,
+            ),
+        )
 
     @staticmethod
     def _iter_vllm_payloads(row: Any) -> Iterator[Any]:
@@ -671,11 +762,20 @@ def _map_task(
     TaskContext.set_current(ctx)
     stats = BlockExecStats.builder()
     map_transformer.set_target_max_block_size(ctx.target_max_block_size)
+    is_vllm_op = "vllm" in ctx.op_name.lower()
     with MemoryProfiler(data_context.memory_usage_poll_interval_s) as profiler:
         for b_out in map_transformer.apply_transform(iter(blocks), ctx):
             # TODO(Clark): Add input file propagation from input blocks.
-            m_out = BlockAccessor.for_block(b_out).get_metadata()
-            s_out = BlockAccessor.for_block(b_out).schema()
+            accessor = BlockAccessor.for_block(b_out)
+            m_out = accessor.get_metadata()
+            s_out = accessor.schema()
+            if is_vllm_op:
+                (
+                    input_token_stats,
+                    output_token_stats,
+                ) = MapOperator._summarize_vllm_token_stats_for_block(b_out)
+                m_out.vllm_input_token_stats = input_token_stats
+                m_out.vllm_output_token_stats = output_token_stats
             m_out.exec_stats = stats.build()
             m_out.exec_stats.udf_time_s = map_transformer.udf_time()
             m_out.exec_stats.task_idx = ctx.task_idx

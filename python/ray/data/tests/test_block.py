@@ -5,7 +5,12 @@ import pyarrow as pa
 import pytest
 
 from ray.data._internal.planner.exchange.sort_task_spec import SortKey
-from ray.data.block import BlockAccessor, BlockColumnAccessor
+from ray.data.block import (
+    BlockAccessor,
+    BlockColumnAccessor,
+    BlockMetadata,
+    BlockMetadataWithSchema,
+)
 
 
 def test_find_partitions_single_column_ascending():
@@ -156,3 +161,22 @@ def test_find_partitions_duplicates():
     assert partitions[1].to_pydict() == {"value": []}  # [1,2)
     assert partitions[2].to_pydict() == {"value": [2, 2, 2, 2, 2]}  # [2,3)
     assert partitions[3].to_pydict() == {"value": []}  # >=3
+
+
+def test_block_metadata_with_schema_preserves_vllm_token_stats():
+    metadata = BlockMetadata(
+        num_rows=5,
+        size_bytes=128,
+        exec_stats=None,
+        input_files=[],
+        vllm_input_token_stats={"count": 2, "sum": 6.0, "sum_sq": 20.0},
+        vllm_output_token_stats={"count": 3, "sum": 18.0, "sum_sq": 110.0},
+    )
+    metadata_with_schema = BlockMetadataWithSchema(metadata=metadata, schema=None)
+
+    assert metadata_with_schema.vllm_input_token_stats == metadata.vllm_input_token_stats
+    assert metadata_with_schema.vllm_output_token_stats == metadata.vllm_output_token_stats
+
+    roundtrip = metadata_with_schema.metadata
+    assert roundtrip.vllm_input_token_stats == metadata.vllm_input_token_stats
+    assert roundtrip.vllm_output_token_stats == metadata.vllm_output_token_stats

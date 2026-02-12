@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -331,11 +332,13 @@ class VLLMWorkloadFeatureExtractor:
         max_rows: int = 2048,
         seen_cache: int = 1024,
         log_interval_s: float = 30.0,
+        enable_queue_scan_fallback: Optional[bool] = None,
     ):
         self._max_blocks = max_blocks
         self._max_rows = max_rows
         self._seen_cache = seen_cache
         self._log_interval_s = log_interval_s
+        self._enable_queue_scan_fallback = enable_queue_scan_fallback
         self._seen_ids: Dict[Any, Deque[str]] = defaultdict(lambda: deque(maxlen=seen_cache))
         self._seen_set: Dict[Any, set] = defaultdict(set)
         self._last_log_time: Dict[Any, float] = defaultdict(lambda: 0.0)
@@ -355,6 +358,13 @@ class VLLMWorkloadFeatureExtractor:
         if metrics_features is not None:
             self._maybe_log_features(op, metrics_features, source="metrics")
             return metrics_features
+        if not self._is_queue_scan_fallback_enabled(op):
+            self._maybe_log_missing(
+                op,
+                op_state,
+                reason="metrics_unavailable_queue_scan_disabled",
+            )
+            return None
         bundles = list(self._iter_output_bundles(op, op_state))
         if not bundles:
             self._maybe_log_missing(op, op_state, reason="empty_output_queue")
@@ -488,6 +498,23 @@ class VLLMWorkloadFeatureExtractor:
             mean_output_tokens=float(mean_out),
             var_output_tokens=float(var_out),
         )
+
+    def _is_queue_scan_fallback_enabled(self, op: Any) -> bool:
+        if self._enable_queue_scan_fallback is not None:
+            return bool(self._enable_queue_scan_fallback)
+
+        data_context = getattr(op, "data_context", None)
+        config_getter = getattr(data_context, "get_config", None)
+        if callable(config_getter):
+            configured = config_getter("enable_vllm_feature_queue_scan_fallback", None)
+            if configured is not None:
+                return bool(configured)
+
+        env_value = os.environ.get("RAY_DATA_ENABLE_VLLM_FEATURE_QUEUE_SCAN_FALLBACK")
+        if env_value is None:
+            return False
+        normalized = env_value.strip().lower()
+        return normalized in ("1", "true", "yes", "on")
 
     def _iter_output_bundles(self, op: Any, op_state: Any) -> Iterable[Any]:
         """Best-effort snapshot of output bundles without mutating queues."""

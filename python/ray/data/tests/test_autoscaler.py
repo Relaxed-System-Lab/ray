@@ -1,6 +1,6 @@
 import time
 from contextlib import contextmanager
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -11,6 +11,9 @@ from ray.data import ExecutionResources
 from ray.data._internal.execution.autoscaler.default_autoscaler import (
     ActorPoolScalingRequest,
     DefaultAutoscaler,
+)
+from ray.data._internal.execution.autoscaler.adaptation_layer import (
+    VLLMWorkloadFeatureExtractor,
 )
 from ray.data._internal.execution.operators.actor_pool_map_operator import _ActorPool
 from ray.data._internal.execution.operators.base_physical_operator import (
@@ -237,6 +240,47 @@ def test_cluster_scaling():
     autoscaler._send_resource_request.assert_called_once_with(
         [{"CPU": 1}, {"CPU": 2}, {"CPU": 2}]
     )
+
+
+def test_vllm_feature_extractor_queue_scan_disabled_by_default():
+    extractor = VLLMWorkloadFeatureExtractor()
+    op = SimpleNamespace(
+        name="MapBatches(VideoCaptionVLLM)",
+        metrics=SimpleNamespace(extra_metrics={}),
+        data_context=SimpleNamespace(
+            get_config=lambda key, default=None: default,
+        ),
+    )
+    op_state = SimpleNamespace(output_queue=None)
+
+    def _raise_if_called(*args, **kwargs):
+        raise AssertionError("queue-scan should not be called when fallback is disabled")
+
+    extractor._iter_output_bundles = _raise_if_called
+    assert extractor.extract(op, op_state) is None
+
+
+def test_vllm_feature_extractor_queue_scan_enabled_from_context():
+    extractor = VLLMWorkloadFeatureExtractor()
+    op = SimpleNamespace(
+        name="MapBatches(VideoCaptionVLLM)",
+        metrics=SimpleNamespace(extra_metrics={}),
+        data_context=SimpleNamespace(
+            get_config=lambda key, default=None: (
+                True if key == "enable_vllm_feature_queue_scan_fallback" else default
+            ),
+        ),
+    )
+    op_state = SimpleNamespace(output_queue=None)
+    called = {"value": False}
+
+    def _iter_output_bundles(*args, **kwargs):
+        called["value"] = True
+        return []
+
+    extractor._iter_output_bundles = _iter_output_bundles
+    assert extractor.extract(op, op_state) is None
+    assert called["value"] is True
 
 
 class BarrierWaiter:

@@ -214,6 +214,12 @@ class BlockMetadata(BlockStats):
     #: The list of file paths used to generate this block, or
     #: the empty list if indeterminate.
     input_files: Optional[List[str]]
+    #: Optional vLLM input token aggregate statistics for this block.
+    #: Expected shape: {"count": n, "sum": s, "sum_sq": ss}.
+    vllm_input_token_stats: Optional[Dict[str, float]] = None
+    #: Optional vLLM output token aggregate statistics for this block.
+    #: Expected shape: {"count": n, "sum": s, "sum_sq": ss}.
+    vllm_output_token_stats: Optional[Dict[str, float]] = None
 
     def to_stats(self):
         return BlockStats(
@@ -238,6 +244,8 @@ class BlockMetadataWithSchema(BlockMetadata):
             size_bytes=metadata.size_bytes,
             num_rows=metadata.num_rows,
             exec_stats=metadata.exec_stats,
+            vllm_input_token_stats=metadata.vllm_input_token_stats,
+            vllm_output_token_stats=metadata.vllm_output_token_stats,
         )
         self.schema = schema
 
@@ -256,6 +264,8 @@ class BlockMetadataWithSchema(BlockMetadata):
             size_bytes=self.size_bytes,
             exec_stats=self.exec_stats,
             input_files=self.input_files,
+            vllm_input_token_stats=self.vllm_input_token_stats,
+            vllm_output_token_stats=self.vllm_output_token_stats,
         )
 
 
