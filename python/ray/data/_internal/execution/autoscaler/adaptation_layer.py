@@ -1,17 +1,13 @@
 import copy
 import logging
 import math
-import os
 import random
 import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
-
-import ray
-from ray.data.block import BlockAccessor
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -27,25 +23,6 @@ except Exception:  # pragma: no cover - optional dependency
     Matern = None
     C = None
     _SKLEARN_AVAILABLE = False
-
-
-@dataclass
-class RunningStats:
-    count: int = 0
-    mean: float = 0.0
-    m2: float = 0.0
-
-    def update(self, value: float) -> None:
-        self.count += 1
-        delta = value - self.mean
-        self.mean += delta / self.count
-        delta2 = value - self.mean
-        self.m2 += delta * delta2
-
-    def variance(self) -> float:
-        if self.count < 2:
-            return 0.0
-        return self.m2 / (self.count - 1)
 
 
 @dataclass
@@ -323,94 +300,25 @@ class VLLMConfigOptimizer:
 
 
 class VLLMWorkloadFeatureExtractor:
-    """Extract vLLM workload features from operator queues or metrics."""
+    """Extract vLLM workload features from operator metrics."""
 
     def __init__(
         self,
         *,
-        max_blocks: int = 64,
-        max_rows: int = 2048,
-        seen_cache: int = 1024,
         log_interval_s: float = 30.0,
-        enable_queue_scan_fallback: Optional[bool] = None,
     ):
-        self._max_blocks = max_blocks
-        self._max_rows = max_rows
-        self._seen_cache = seen_cache
         self._log_interval_s = log_interval_s
-        self._enable_queue_scan_fallback = enable_queue_scan_fallback
-        self._seen_ids: Dict[Any, Deque[str]] = defaultdict(lambda: deque(maxlen=seen_cache))
-        self._seen_set: Dict[Any, set] = defaultdict(set)
         self._last_log_time: Dict[Any, float] = defaultdict(lambda: 0.0)
         self._last_log_source: Dict[Any, str] = {}
-        self._last_missing_log_time: Dict[Any, float] = defaultdict(lambda: 0.0)
 
     def reset(self, op: Any) -> None:
-        if op in self._seen_ids:
-            self._seen_ids.pop(op, None)
-        if op in self._seen_set:
-            self._seen_set.pop(op, None)
         self._last_log_time.pop(op, None)
         self._last_log_source.pop(op, None)
 
-    def extract(self, op: Any, op_state: Any) -> Optional[WorkloadFeatures]:
-        metrics_features = self._extract_from_metrics(op)
-        if metrics_features is not None:
-            self._maybe_log_features(op, metrics_features, source="metrics")
-            return metrics_features
-        if not self._is_queue_scan_fallback_enabled(op):
-            self._maybe_log_missing(
-                op,
-                op_state,
-                reason="metrics_unavailable_queue_scan_disabled",
-            )
-            return None
-        bundles = list(self._iter_output_bundles(op, op_state))
-        if not bundles:
-            self._maybe_log_missing(op, op_state, reason="empty_output_queue")
-            return None
-
-        input_stats = RunningStats()
-        output_stats = RunningStats()
-        seen_ids = self._seen_ids[op]
-        seen_set = self._seen_set[op]
-
-        rows_collected = 0
-        blocks_checked = 0
-        for bundle in bundles:
-            for block_ref, _ in bundle.blocks:
-                block_id = self._block_ref_id(block_ref)
-                if block_id in seen_set:
-                    continue
-                seen_set.add(block_id)
-                seen_ids.append(block_id)
-                while len(seen_set) > self._seen_cache:
-                    old = seen_ids.popleft()
-                    seen_set.discard(old)
-                try:
-                    block = ray.get(block_ref)
-                except Exception:
-                    continue
-                rows_collected += self._accumulate_from_block(
-                    block, input_stats, output_stats, self._max_rows - rows_collected
-                )
-                blocks_checked += 1
-                if rows_collected >= self._max_rows or blocks_checked >= self._max_blocks:
-                    break
-            if rows_collected >= self._max_rows or blocks_checked >= self._max_blocks:
-                break
-
-        if input_stats.count == 0 and output_stats.count == 0:
-            self._maybe_log_missing(op, op_state, reason="no_token_fields")
-            return None
-
-        features = WorkloadFeatures(
-            mean_input_tokens=input_stats.mean,
-            var_input_tokens=input_stats.variance(),
-            mean_output_tokens=output_stats.mean,
-            var_output_tokens=output_stats.variance(),
-        )
-        self._maybe_log_features(op, features, source="queue")
+    def extract(self, op: Any, op_state: Any) -> WorkloadFeatures:
+        del op_state
+        features = self._extract_from_metrics(op)
+        self._maybe_log_features(op, features, source="metrics")
         return features
 
     def _maybe_log_features(
@@ -432,242 +340,49 @@ class VLLMWorkloadFeatureExtractor:
             features.var_output_tokens,
         )
 
-    def _maybe_log_missing(self, op: Any, op_state: Any, *, reason: str) -> None:
-        now = time.time()
-        last = self._last_missing_log_time[op]
-        if now - last < self._log_interval_s:
-            return
-        self._last_missing_log_time[op] = now
-        output_queue = getattr(op_state, "output_queue", None)
-        op_queue = getattr(op, "_output_queue", None)
-
-        output_bundles = None
-        output_blocks = None
-        if output_queue is not None:
-            try:
-                output_bundles = len(output_queue)
-            except Exception:
-                output_bundles = None
-            output_blocks = getattr(output_queue, "num_blocks", None)
-
-        op_queue_size = None
-        if op_queue is not None:
-            task_outputs = getattr(op_queue, "_task_outputs", None)
-            if isinstance(task_outputs, dict):
-                try:
-                    op_queue_size = sum(len(v) for v in task_outputs.values())
-                except Exception:
-                    op_queue_size = None
-            else:
-                queue_deque = getattr(op_queue, "_queue", None)
-                if queue_deque is not None:
-                    try:
-                        op_queue_size = len(queue_deque)
-                    except Exception:
-                        op_queue_size = None
-
-        logger.info(
-            "vLLM feature snapshot missing for %s (reason=%s). output_queue_bundles=%s "
-            "output_queue_blocks=%s op_queue_size=%s",
-            getattr(op, "name", op),
-            reason,
-            output_bundles,
-            output_blocks,
-            op_queue_size,
-        )
-
-    def _extract_from_metrics(self, op: Any) -> Optional[WorkloadFeatures]:
+    def _extract_from_metrics(self, op: Any) -> WorkloadFeatures:
+        op_name = getattr(op, "name", op)
         metrics = getattr(op, "metrics", None)
         if metrics is None:
             metrics = getattr(op, "_metrics", None)
         if metrics is None:
-            return None
+            raise RuntimeError(
+                f"Missing vLLM adaptation metrics for {op_name}: operator metrics unavailable."
+            )
         extra = getattr(metrics, "extra_metrics", None)
-        if not extra:
-            return None
-        try:
-            mean_in = extra["vllm_input_tokens_mean"]
-            var_in = extra["vllm_input_tokens_var"]
-            mean_out = extra["vllm_output_tokens_mean"]
-            var_out = extra["vllm_output_tokens_var"]
-        except KeyError:
-            return None
-        return WorkloadFeatures(
-            mean_input_tokens=float(mean_in),
-            var_input_tokens=float(var_in),
-            mean_output_tokens=float(mean_out),
-            var_output_tokens=float(var_out),
+        if not isinstance(extra, dict):
+            raise RuntimeError(
+                f"Missing vLLM adaptation metrics for {op_name}: "
+                f"extra_metrics unavailable (type={type(extra).__name__})."
+            )
+        required_keys = (
+            "vllm_input_tokens_mean",
+            "vllm_input_tokens_var",
+            "vllm_output_tokens_mean",
+            "vllm_output_tokens_var",
         )
-
-    def _is_queue_scan_fallback_enabled(self, op: Any) -> bool:
-        if self._enable_queue_scan_fallback is not None:
-            return bool(self._enable_queue_scan_fallback)
-
-        data_context = getattr(op, "data_context", None)
-        config_getter = getattr(data_context, "get_config", None)
-        if callable(config_getter):
-            configured = config_getter("enable_vllm_feature_queue_scan_fallback", None)
-            if configured is not None:
-                return bool(configured)
-
-        env_value = os.environ.get("RAY_DATA_ENABLE_VLLM_FEATURE_QUEUE_SCAN_FALLBACK")
-        if env_value is None:
-            return False
-        normalized = env_value.strip().lower()
-        return normalized in ("1", "true", "yes", "on")
-
-    def _iter_output_bundles(self, op: Any, op_state: Any) -> Iterable[Any]:
-        """Best-effort snapshot of output bundles without mutating queues."""
-        # Try op_state output queue first (buffer between operators).
-        queue = getattr(op_state, "output_queue", None)
-        bundles = self._snapshot_opbuffer_queue(queue)
-        if bundles:
-            return bundles
-
-        # Fallback to operator-level output queue (per-task ordering).
-        op_queue = getattr(op, "_output_queue", None)
-        bundles = self._snapshot_operator_queue(op_queue)
-        if bundles:
-            return bundles
-
-        return []
-
-    def _snapshot_opbuffer_queue(self, queue: Any) -> List[Any]:
-        if queue is None:
-            return []
-        lock = getattr(queue, "_lock", None)
-        bundle_queue = getattr(queue, "_queue", None)
-        if lock is not None:
-            with lock:
-                return self._snapshot_bundle_queue(bundle_queue)
-        return self._snapshot_bundle_queue(bundle_queue)
-
-    def _snapshot_operator_queue(self, queue: Any) -> List[Any]:
-        if queue is None:
-            return []
-        # Ordered output queue: sample from per-task deques.
-        task_outputs = getattr(queue, "_task_outputs", None)
-        if isinstance(task_outputs, dict):
-            bundles: List[Any] = []
-            for outputs in task_outputs.values():
-                try:
-                    for bundle in list(outputs):
-                        bundles.append(bundle)
-                        if len(bundles) >= self._max_blocks:
-                            return bundles
-                except Exception:
-                    continue
-            return bundles
-        # Unordered output queue: deque of bundles.
-        queue_deque = getattr(queue, "_queue", None)
-        if queue_deque is not None:
-            try:
-                return list(queue_deque)[: self._max_blocks]
-            except Exception:
-                return []
-        return []
-
-    def _snapshot_bundle_queue(self, bundle_queue: Any) -> List[Any]:
-        if bundle_queue is None:
-            return []
-        # Best-effort snapshot without mutating the queue.
-        head = getattr(bundle_queue, "_head", None)
-        if head is None:
-            peek = getattr(bundle_queue, "peek", None)
-            if callable(peek):
-                bundle = peek()
-                return [bundle] if bundle is not None else []
-            return []
-        bundles: List[Any] = []
-        node = head
-        while node is not None and len(bundles) < self._max_blocks:
-            bundles.append(node.value)
-            node = node.next
-        return bundles
-
-    def _accumulate_from_block(
-        self,
-        block: Any,
-        input_stats: RunningStats,
-        output_stats: RunningStats,
-        row_budget: int,
-    ) -> int:
-        accessor = BlockAccessor.for_block(block)
-        rows_iter = accessor.iter_rows(public_row_format=True)
-        rows_used = 0
-        for row in rows_iter:
-            for in_tokens, out_tokens in self._iter_token_pairs(row):
-                if in_tokens is not None:
-                    input_stats.update(in_tokens)
-                if out_tokens is not None:
-                    output_stats.update(out_tokens)
-                rows_used += 1
-                if rows_used >= row_budget:
-                    break
-            if rows_used >= row_budget:
-                break
-        return rows_used
-
-    def _iter_token_pairs(
-        self, row: Any
-    ) -> Iterable[Tuple[Optional[float], Optional[float]]]:
-        payload = row
-        if isinstance(row, dict) and "__data" in row:
-            payload = row.get("__data")
-
-        if isinstance(payload, (list, tuple)):
-            for item in payload:
-                yield self._extract_tokens_from_payload(item)
-            return
-
-        yield self._extract_tokens_from_payload(payload)
-
-    def _extract_tokens_from_payload(
-        self, payload: Any
-    ) -> Tuple[Optional[float], Optional[float]]:
-        in_tokens = self._read_token_value(payload, "num_input_tokens", "prompt_token_ids")
-        out_tokens = self._read_token_value(payload, "num_generated_tokens", "generated_tokens")
-        return in_tokens, out_tokens
-
-    def _read_token_value(
-        self,
-        payload: Any,
-        count_key: str,
-        list_key: str,
-    ) -> Optional[float]:
-        value = None
-        if isinstance(payload, dict):
-            value = payload.get(count_key)
-            if value is None and list_key in payload:
-                try:
-                    value = len(payload.get(list_key) or [])
-                except Exception:
-                    value = None
-        else:
-            if hasattr(payload, count_key):
-                value = getattr(payload, count_key)
-            elif hasattr(payload, list_key):
-                try:
-                    value = len(getattr(payload, list_key) or [])
-                except Exception:
-                    value = None
-        if value is None:
-            return None
+        missing_keys = [key for key in required_keys if key not in extra]
+        if missing_keys:
+            available_keys = sorted(extra.keys())
+            raise RuntimeError(
+                f"Missing vLLM adaptation metrics for {op_name}: missing={missing_keys}, "
+                f"available={available_keys}."
+            )
         try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return None
-        if value < 0:
-            return None
-        return value
-
-    def _block_ref_id(self, block_ref: Any) -> str:
-        if hasattr(block_ref, "hex"):
-            try:
-                return block_ref.hex()
-            except Exception:
-                pass
-        return str(block_ref)
+            mean_in = float(extra["vllm_input_tokens_mean"])
+            var_in = float(extra["vllm_input_tokens_var"])
+            mean_out = float(extra["vllm_output_tokens_mean"])
+            var_out = float(extra["vllm_output_tokens_var"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Invalid vLLM adaptation metrics for {op_name}: {extra}."
+            ) from exc
+        return WorkloadFeatures(
+            mean_input_tokens=mean_in,
+            var_input_tokens=var_in,
+            mean_output_tokens=mean_out,
+            var_output_tokens=var_out,
+        )
 
 
 class VLLMAdaptationLayer:

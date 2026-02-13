@@ -242,45 +242,49 @@ def test_cluster_scaling():
     )
 
 
-def test_vllm_feature_extractor_queue_scan_disabled_by_default():
+def test_vllm_feature_extractor_extracts_from_metrics():
+    extractor = VLLMWorkloadFeatureExtractor()
+    op = SimpleNamespace(
+        name="MapBatches(VideoCaptionVLLM)",
+        metrics=SimpleNamespace(
+            extra_metrics={
+                "vllm_input_tokens_mean": 11.0,
+                "vllm_input_tokens_var": 4.0,
+                "vllm_output_tokens_mean": 22.0,
+                "vllm_output_tokens_var": 9.0,
+            }
+        ),
+    )
+    op_state = SimpleNamespace(output_queue=None)
+    features = extractor.extract(op, op_state)
+
+    assert features.mean_input_tokens == pytest.approx(11.0)
+    assert features.var_input_tokens == pytest.approx(4.0)
+    assert features.mean_output_tokens == pytest.approx(22.0)
+    assert features.var_output_tokens == pytest.approx(9.0)
+
+
+def test_vllm_feature_extractor_raises_when_metrics_missing():
     extractor = VLLMWorkloadFeatureExtractor()
     op = SimpleNamespace(
         name="MapBatches(VideoCaptionVLLM)",
         metrics=SimpleNamespace(extra_metrics={}),
-        data_context=SimpleNamespace(
-            get_config=lambda key, default=None: default,
-        ),
     )
     op_state = SimpleNamespace(output_queue=None)
-
-    def _raise_if_called(*args, **kwargs):
-        raise AssertionError("queue-scan should not be called when fallback is disabled")
-
-    extractor._iter_output_bundles = _raise_if_called
-    assert extractor.extract(op, op_state) is None
+    with pytest.raises(RuntimeError, match="Missing vLLM adaptation metrics"):
+        extractor.extract(op, op_state)
 
 
-def test_vllm_feature_extractor_queue_scan_enabled_from_context():
+def test_vllm_feature_extractor_raises_when_metrics_unavailable():
     extractor = VLLMWorkloadFeatureExtractor()
     op = SimpleNamespace(
         name="MapBatches(VideoCaptionVLLM)",
-        metrics=SimpleNamespace(extra_metrics={}),
-        data_context=SimpleNamespace(
-            get_config=lambda key, default=None: (
-                True if key == "enable_vllm_feature_queue_scan_fallback" else default
-            ),
-        ),
+        metrics=None,
+        _metrics=None,
     )
     op_state = SimpleNamespace(output_queue=None)
-    called = {"value": False}
-
-    def _iter_output_bundles(*args, **kwargs):
-        called["value"] = True
-        return []
-
-    extractor._iter_output_bundles = _iter_output_bundles
-    assert extractor.extract(op, op_state) is None
-    assert called["value"] is True
+    with pytest.raises(RuntimeError, match="operator metrics unavailable"):
+        extractor.extract(op, op_state)
 
 
 class BarrierWaiter:
